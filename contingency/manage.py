@@ -5,12 +5,11 @@ import sys
 from dotenv import load_dotenv
 from pathlib import Path
 
+load_dotenv(Path(__file__).resolve().parent / 'dev.env')
+
 
 def main():
     """Run administrative tasks."""
-    if os.getenv('DJANGO_ENV') == 'development':
-        load_dotenv(Path(__file__).resolve().parent / 'dev.env')
-    os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'contingency.settings')
     try:
         from django.core.management import execute_from_command_line
     except ImportError as exc:

@@ -35,19 +35,20 @@ class DuckDBModel:
 
     @classmethod
     def _resolve_path(cls, **partitions: str) -> str:
-        """
-        Monta o subpath Hive a partir das partições informadas.
-        Ex: _resolve_path(modulo="contratos", ano="2024")
-            → "portal/parquet/modulo=contratos/ano=2024"
-        """
         if cls.dataset_path is None:
             raise NotImplementedError(f"{cls.__name__} deve definir 'dataset_path'")
 
         PARTITION_ORDER = ("modulo", "ano", "mes")
         path = cls.dataset_path.rstrip("/")
+
+        # injeta o modulo da classe se não foi passado explicitamente
+        if "modulo" not in partitions and hasattr(cls, "modulo"):
+            partitions = {"modulo": cls.modulo, **partitions}
+
         for col in PARTITION_ORDER:
             if col in partitions:
                 path += f"/{col}={partitions[col]}"
+
         return path
 
     # ------------------------------------------------------------------ #
