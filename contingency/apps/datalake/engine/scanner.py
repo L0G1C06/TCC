@@ -16,8 +16,8 @@ from .s3 import DataLakeConfig
 class PartitionMap:
     dataset: str
     tree: dict[str, dict[str, list[str]]] = field(default_factory=dict)
-    # novo: guarda quantos arquivos existem em cada partição
     file_count: dict[str, int] = field(default_factory=dict)
+    flat_modulos: dict[str, int] = field(default_factory=dict)
 
     def _partition_key(self, modulo: str, ano: str, mes: str) -> str:
         return f"modulo={modulo}/ano={ano}/mes={mes}"
@@ -40,7 +40,10 @@ class PartitionMap:
 
     @property
     def modulos(self) -> list[str]:
-        return sorted(self.tree.keys())
+        return sorted(set(self.tree.keys()) | set(self.flat_modulos.keys()))
+
+    def is_flat(self, modulo: str) -> bool:
+        return modulo in self.flat_modulos
 
     def anos(self, modulo: str) -> list[str]:
         return sorted(self.tree.get(modulo, {}).keys())
@@ -78,11 +81,13 @@ class S3PartitionScanner:
     BASE_PATH = "data"
 
     # regex que captura os três níveis de partição
-    _RE = re.compile(
+    _RE_HIVE = re.compile(
         r"modulo=(?P<modulo>[^/]+)"
         r"/ano=(?P<ano>[^/]+)"
         r"/mes=(?P<mes>[^/]+)"
     )
+
+    _RE_FLAT = re.compile(r"modulo=(?P<modulo>[^/]+)/[^/]+\.parquet$")
 
     def __init__(self):
         opts = DataLakeConfig.storage_options()
@@ -99,30 +104,34 @@ class S3PartitionScanner:
     def scan(self, dataset_path: str) -> PartitionMap:
         prefix = f"{self.BASE_PATH}/{dataset_path.strip('/')}/"
         tree: dict[str, dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
-        file_count: dict[str, int] = defaultdict(int)  # novo
+        file_count: dict[str, int] = defaultdict(int)
+        flat_modulos: dict[str, int] = defaultdict(int)  # novo
 
         paginator = self._s3.get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=self._bucket, Prefix=prefix):
             for obj in page.get("Contents", []):
                 key: str = obj["Key"]
-                if not key.endswith(".parquet"):  # ignora arquivos que não são parquet
+                if not key.endswith(".parquet"):
                     continue
-                m = self._RE.search(key)
-                if m:
-                    modulo = m.group("modulo")
-                    ano = m.group("ano")
-                    mes = m.group("mes")
 
+                m = self._RE_HIVE.search(key)
+                if m:
+                    # estrutura padrão: modulo/ano/mes
+                    modulo, ano, mes = m.group("modulo"), m.group("ano"), m.group("mes")
                     if mes not in tree[modulo][ano]:
                         tree[modulo][ano].append(mes)
-
-                    pk = f"modulo={modulo}/ano={ano}/mes={mes}"
-                    file_count[pk] += 1  # novo
+                    file_count[f"modulo={modulo}/ano={ano}/mes={mes}"] += 1
+                else:
+                    # estrutura flat: modulo/arquivo.parquet
+                    mf = self._RE_FLAT.search(key)
+                    if mf:
+                        flat_modulos[mf.group("modulo")] += 1
 
         return PartitionMap(
             dataset=dataset_path,
             tree={k: dict(v) for k, v in tree.items()},
             file_count=dict(file_count),
+            flat_modulos=dict(flat_modulos),
         )
 
     def scan_all(self, datasets: dict[str, str]) -> dict[str, PartitionMap]:
