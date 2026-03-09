@@ -1,0 +1,19 @@
+services:
+  django:
+    build: .
+    container_name: contingency
+    restart: always
+    env_file:
+      - ./dev.env
+    environment:
+      - DJANGO_SETTINGS_MODULE=${DJANGO_SETTINGS_MODULE:-contingency.settings}
+      - DJANGO_ENV=${DJANGO_ENV:-prod}
+    volumes:
+      - .:/app
+    ports:
+      - "8000:8000"
+    command: >
+      bash -c "
+      python manage.py migrate --noinput &&
+      gunicorn contingency.wsgi:application --bind 0.0.0.0:8000
+      "
