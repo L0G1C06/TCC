@@ -87,7 +87,15 @@ class S3PartitionScanner:
         r"/mes=(?P<mes>[^/]+)"
     )
 
-    _RE_FLAT = re.compile(r"modulo=(?P<modulo>[^/]+)/[^/]+\.parquet$")
+    _RE_ANO_ONLY = re.compile(
+        r"modulo=(?P<modulo>[^/]+)"
+        r"/ano=(?P<ano>[^/]+)"
+        r"/[^/]+\.parquet$"  # arquivo direto no ano=, sem mes=
+    )
+    _RE_FLAT = re.compile(
+        r"modulo=(?P<modulo>[^/]+)"
+        r"/[^/]+\.parquet$"  # arquivo direto no modulo=, sem ano/mes
+    )
 
     def __init__(self):
         opts = DataLakeConfig.storage_options()
@@ -105,7 +113,7 @@ class S3PartitionScanner:
         prefix = f"{self.BASE_PATH}/{dataset_path.strip('/')}/"
         tree: dict[str, dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
         file_count: dict[str, int] = defaultdict(int)
-        flat_modulos: dict[str, int] = defaultdict(int)  # novo
+        flat_modulos: dict[str, int] = defaultdict(int)
 
         paginator = self._s3.get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=self._bucket, Prefix=prefix):
@@ -116,16 +124,24 @@ class S3PartitionScanner:
 
                 m = self._RE_HIVE.search(key)
                 if m:
-                    # estrutura padrão: modulo/ano/mes
                     modulo, ano, mes = m.group("modulo"), m.group("ano"), m.group("mes")
                     if mes not in tree[modulo][ano]:
                         tree[modulo][ano].append(mes)
                     file_count[f"modulo={modulo}/ano={ano}/mes={mes}"] += 1
-                else:
-                    # estrutura flat: modulo/arquivo.parquet
-                    mf = self._RE_FLAT.search(key)
-                    if mf:
-                        flat_modulos[mf.group("modulo")] += 1
+                    continue
+
+                m = self._RE_ANO_ONLY.search(key)
+                if m:
+                    modulo, ano = m.group("modulo"), m.group("ano")
+                    # registra com mes="unknown" para manter consistência da estrutura
+                    if "unknown" not in tree[modulo][ano]:
+                        tree[modulo][ano].append("unknown")
+                    file_count[f"modulo={modulo}/ano={ano}/mes=unknown"] += 1
+                    continue
+
+                m = self._RE_FLAT.search(key)
+                if m:
+                    flat_modulos[m.group("modulo")] += 1
 
         return PartitionMap(
             dataset=dataset_path,
