@@ -248,9 +248,7 @@ marimo/_lsp/
 __marimo__/
 
 data/
-<<<<<<< HEAD
 *.parquet
 dev.env
-=======
 *.parquet
->>>>>>> develop
+*.duckdb

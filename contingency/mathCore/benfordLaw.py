@@ -3,18 +3,35 @@ Sistema de Detecção de Fraude — Análise de Benford Multi-Dígito
 Implementação completa seguindo o modelo matemático do TCC.
 """
 
-import numpy as np
-import math
-import random
-from collections import Counter
-from dataclasses import dataclass, field
-from typing import Optional
-import warnings
+from __future__ import annotations
 
-from scipy.stats import chi2, shapiro, kstest, norm
+import logging
+import math
+import time
+import warnings
+from collections import Counter
+from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import Optional
+
+import numpy as np
 import pandas as pd
+from scipy.stats import chi2, kstest, shapiro
+from tqdm import tqdm
 
 warnings.filterwarnings("ignore")
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+
+log = logging.getLogger(__name__)
+
+@contextmanager
+def _cronometrar(label: str):
+    """Loga início, fim e duração de um bloco."""
+    log.info("  ▶  %s ...", label)
+    t0 = time.perf_counter()
+    yield
+    log.info("  ✔  %s — %.2fs", label, time.perf_counter() - t0)
 
 # ─────────────────────────────────────────────
 # CONFIGURAÇÃO DE PESOS E LIMIARES
@@ -30,7 +47,7 @@ MAD_THRESHOLDS = dict(
 )
 
 MARGEM_SUSPEITA = 0.02   # desvio mínimo acima do esperado para marcar dígito suspeito
-ALPHA = 0.05             # nível de significância chi²
+ALPHA           = 0.05   # nível de significância chi²
 
 
 # ─────────────────────────────────────────────
@@ -78,9 +95,13 @@ class ClusterResult:
 
 def preprocessar(df: pd.DataFrame, coluna_valor: str = "valor") -> pd.DataFrame:
     """Remove nulos e valores <= 0."""
+    antes = len(df)
     df = df.dropna(subset=[coluna_valor])
     df = df[df[coluna_valor] > 0].copy()
     df = df.reset_index(drop=True)
+    removidos = antes - len(df)
+    log.info("    Pré-processamento: %d → %d registros (%d removidos)",
+             antes, len(df), removidos)
     return df
 
 
@@ -94,8 +115,7 @@ def detectar_outliers(X: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray
     # IQR
     Q1, Q3 = np.percentile(X, 25), np.percentile(X, 75)
     IQR = Q3 - Q1
-    lim_inf, lim_sup = Q1 - 1.5 * IQR, Q3 + 1.5 * IQR
-    outlier_iqr = (X < lim_inf) | (X > lim_sup)
+    outlier_iqr = (X < Q1 - 1.5 * IQR) | (X > Q3 + 1.5 * IQR)
 
     # Z-score
     media, desvio = X.mean(), X.std()
@@ -104,11 +124,13 @@ def detectar_outliers(X: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray
 
     # MAD robusto (modified Z-score)
     mediana = np.median(X)
-    mad = np.median(np.abs(X - mediana))
-    if mad == 0:
-        mad = 1e-9
-    modified_z = 0.6745 * (X - mediana) / mad
-    outlier_mad = np.abs(modified_z) > 3.5
+    mad = np.median(np.abs(X - mediana)) or 1e-9
+    outlier_mad = np.abs(0.6745 * (X - mediana) / mad) > 3.5
+
+    log.info("    Outliers — IQR: %d (%.1f%%)  Z: %d (%.1f%%)  MAD: %d (%.1f%%)",
+             outlier_iqr.sum(), outlier_iqr.mean() * 100,
+             outlier_z.sum(),   outlier_z.mean()   * 100,
+             outlier_mad.sum(), outlier_mad.mean()  * 100)
 
     return outlier_iqr, outlier_z, outlier_mad
 
@@ -120,38 +142,38 @@ def detectar_outliers(X: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray
 def testar_normalidade(X: np.ndarray) -> dict:
     """Shapiro-Wilk (amostras <= 5000) + KS."""
     sample = X if len(X) <= 5000 else np.random.choice(X, 5000, replace=False)
-
     _, p_shapiro = shapiro(sample)
-    _, p_ks = kstest((X - X.mean()) / (X.std() or 1), "norm")
-
-    return dict(p_shapiro=p_shapiro, p_ks=p_ks, normal=(p_shapiro > ALPHA and p_ks > ALPHA))
+    _, p_ks      = kstest((X - X.mean()) / (X.std() or 1), "norm")
+    normal = p_shapiro > ALPHA and p_ks > ALPHA
+    log.info("    Normalidade — Shapiro p=%.4f  KS p=%.4f  normal=%s",
+             p_shapiro, p_ks, normal)
+    return dict(p_shapiro=p_shapiro, p_ks=p_ks, normal=normal)
 
 
 # ─────────────────────────────────────────────
-# EXTRAÇÃO DE DÍGITOS
+# EXTRAÇÃO DE DÍGITOS — VETORIZADA
 # ─────────────────────────────────────────────
 
-def _str_int(n: float) -> str:
-    return str(int(abs(n)))
+def _extrair_digitos_vetorizado(X: np.ndarray) -> dict[str, np.ndarray]:
+    """
+    Extrai os 4 níveis de dígito de uma vez para todo o array.
+    Retorna dict com arrays int64 para d1, d2, d12, last.
+    Valores sem dígito suficiente recebem -1 (sentinela, filtrado depois).
+    """
+    inteiros = np.abs(X).astype(np.int64)
 
+    with np.errstate(divide="ignore", invalid="ignore"):
+        n_digits = np.where(inteiros > 0, np.floor(np.log10(inteiros)).astype(int) + 1, 1)
 
-def primeiro_digito(n: float) -> int:
-    s = _str_int(n)
-    return int(s[0]) if s else None
+    pot  = (10 ** (n_digits - 1)).astype(np.int64)
+    pot2 = (10 ** np.maximum(n_digits - 2, 0)).astype(np.int64)
 
+    d1   = (inteiros // pot) % 10
+    d2   = np.where(n_digits >= 2, (inteiros // (pot // 10)) % 10, -1)
+    d12  = np.where(n_digits >= 2, (inteiros // pot2) % 100,       -1)
+    last = inteiros % 10
 
-def segundo_digito(n: float) -> Optional[int]:
-    s = _str_int(n)
-    return int(s[1]) if len(s) >= 2 else None
-
-
-def dois_primeiros_digitos(n: float) -> Optional[int]:
-    s = _str_int(n)
-    return int(s[:2]) if len(s) >= 2 else None
-
-
-def ultimo_digito(n: float) -> int:
-    return int(_str_int(n)[-1])
+    return dict(d1=d1, d2=d2, d12=d12, last=last)
 
 
 # ─────────────────────────────────────────────
@@ -179,32 +201,28 @@ def freq_esperada_last() -> dict:
 # NÚCLEO BENFORD — calcula MAD, chi², dígitos suspeitos
 # ─────────────────────────────────────────────
 
-def _analisar_distribuicao(valores: list, freq_exp: dict, label: str) -> BenfordResult:
-    total = len(valores)
+def _analisar_distribuicao(valores: np.ndarray | list, freq_exp: dict, label: str) -> BenfordResult:
+    arr   = np.asarray(valores)
+    arr   = arr[arr >= 0]           # remove sentinela -1
+    total = len(arr)
+
     if total == 0:
         return BenfordResult(0, 0, 1, {}, freq_exp, [], False)
 
-    freq_obs_raw = Counter(valores)
-    digitos = sorted(freq_exp.keys())
+    digitos  = sorted(freq_exp.keys())
+    counts   = Counter(arr.tolist())
+    freq_obs = {d: counts.get(d, 0) / total for d in digitos}
 
-    freq_obs = {d: freq_obs_raw.get(d, 0) / total for d in digitos}
+    mad = float(np.mean([abs(freq_obs[d] - freq_exp[d]) for d in digitos]))
 
-    # MAD
-    mad = np.mean([abs(freq_obs[d] - freq_exp[d]) for d in digitos])
-
-    # Chi²
     chi2_stat = sum(
         ((freq_obs[d] - freq_exp[d]) ** 2) / freq_exp[d]
-        for d in digitos
-        if freq_exp[d] > 0
+        for d in digitos if freq_exp[d] > 0
     ) * total
 
-    gl = len(digitos) - 1
-    p_value = 1 - chi2.cdf(chi2_stat, gl)
+    p_value = 1 - chi2.cdf(chi2_stat, len(digitos) - 1)
 
-    # Dígitos suspeitos
     digitos_suspeitos = [d for d in digitos if freq_obs[d] > freq_exp[d] + MARGEM_SUSPEITA]
-
     desvio = mad > MAD_THRESHOLDS.get(label, 0.015) or p_value < ALPHA
 
     return BenfordResult(
@@ -222,19 +240,26 @@ def _analisar_distribuicao(valores: list, freq_exp: dict, label: str) -> Benford
 # ETAPA 4 — BENFORD MULTI-DÍGITO
 # ─────────────────────────────────────────────
 
-def analisar_benford_completo(valores: list) -> dict[str, BenfordResult]:
-    """Executa análise Benford nos 4 níveis de dígito."""
+def analisar_benford_completo(
+    valores: list | np.ndarray,
+    digitos_vetorizados: Optional[dict[str, np.ndarray]] = None,
+) -> dict[str, BenfordResult]:
+    """
+    Executa análise Benford nos 4 níveis de dígito.
 
-    D1    = [primeiro_digito(v)        for v in valores if primeiro_digito(v) is not None]
-    D2    = [segundo_digito(v)         for v in valores if segundo_digito(v) is not None]
-    D12   = [dois_primeiros_digitos(v) for v in valores if dois_primeiros_digitos(v) is not None]
-    DLAST = [ultimo_digito(v)          for v in valores]
+    Se `digitos_vetorizados` for fornecido (dict retornado por
+    _extrair_digitos_vetorizado), reutiliza os arrays já calculados —
+    útil no loop de clusters para evitar reprocessamento.
+    """
+    if digitos_vetorizados is None:
+        digitos_vetorizados = _extrair_digitos_vetorizado(np.asarray(valores, dtype=np.float64))
 
+    d = digitos_vetorizados
     return {
-        "d1":   _analisar_distribuicao(D1,    freq_esperada_d1(),   "d1"),
-        "d2":   _analisar_distribuicao(D2,    freq_esperada_d2(),   "d2"),
-        "d12":  _analisar_distribuicao(D12,   freq_esperada_d12(),  "d12"),
-        "last": _analisar_distribuicao(DLAST, freq_esperada_last(), "last"),
+        "d1":   _analisar_distribuicao(d["d1"],   freq_esperada_d1(),   "d1"),
+        "d2":   _analisar_distribuicao(d["d2"],   freq_esperada_d2(),   "d2"),
+        "d12":  _analisar_distribuicao(d["d12"],  freq_esperada_d12(),  "d12"),
+        "last": _analisar_distribuicao(d["last"], freq_esperada_last(), "last"),
     }
 
 
@@ -247,25 +272,50 @@ def benford_desvio_global(resultados: dict[str, BenfordResult]) -> bool:
 
 
 # ─────────────────────────────────────────────
-# ETAPA 7 — FLAG POR TRANSAÇÃO
+# ETAPA 6 — FLAGS POR TRANSAÇÃO (VETORIZADA)
 # ─────────────────────────────────────────────
 
+def calcular_flags_benford_vetorizado(
+    digitos: dict[str, np.ndarray],
+    benford_global: dict[str, BenfordResult],
+) -> np.ndarray:
+    """
+    Substitui o loop Python de flag_benford_transacao por operações NumPy.
+
+    Para cada nível usa np.isin() — O(n) com lookup em hash set interno —
+    em vez de chamar uma função Python por transação.
+    """
+    n     = len(digitos["d1"])
+    flags = np.zeros(n, dtype=np.int32)
+
+    for nivel, arr in digitos.items():
+        suspeitos = np.array(benford_global[nivel].digitos_suspeitos, dtype=np.int64)
+        if suspeitos.size == 0:
+            continue
+        valido   = arr >= 0                          # exclui sentinela -1
+        suspeito = np.isin(arr, suspeitos) & valido
+        flags   += suspeito.astype(np.int32)
+
+    return flags
+
+
+# Mantido para compatibilidade com testes unitários
 def flag_benford_transacao(valor: float, resultados: dict[str, BenfordResult]) -> int:
-    flag = 0
+    s = str(int(abs(valor)))
     mapa = {
-        "d1":   primeiro_digito(valor),
-        "d2":   segundo_digito(valor),
-        "d12":  dois_primeiros_digitos(valor),
-        "last": ultimo_digito(valor),
+        "d1":   int(s[0]),
+        "d2":   int(s[1]) if len(s) >= 2 else -1,
+        "d12":  int(s[:2]) if len(s) >= 2 else -1,
+        "last": int(s[-1]),
     }
-    for nivel, digito in mapa.items():
-        if digito is not None and digito in resultados[nivel].digitos_suspeitos:
-            flag += 1
-    return flag
+    return sum(
+        1 for nivel, d in mapa.items()
+        if d >= 0 and d in resultados[nivel].digitos_suspeitos
+    )
 
 
 # ─────────────────────────────────────────────
-# ETAPA 8 — ANÁLISE POR CLUSTER
+# ETAPA 7 — ANÁLISE POR CLUSTER
 # ─────────────────────────────────────────────
 
 def analisar_clusters(
@@ -273,20 +323,33 @@ def analisar_clusters(
     colunas_cluster: list[str],
     coluna_valor: str,
     outlier_mask: np.ndarray,
+    digitos_globais: dict[str, np.ndarray],
     limiar_mad: float = 0.015,
     limiar_taxa_outliers: float = 0.20,
 ) -> dict[tuple, ClusterResult]:
+    """
+    Analisa cada cluster.
 
-    resultados = {}
-    for chave, grupo in df.groupby(colunas_cluster):
-        idx = grupo.index
-        vals = grupo[coluna_valor].tolist()
+    Recebe `digitos_globais` para fatiar os arrays por índice em vez de
+    recalcular a extração de dígitos dentro de cada grupo.
+    """
+    grupos       = list(df.groupby(colunas_cluster))
+    resultados:  dict[tuple, ClusterResult] = {}
+    n_alto_risco = 0
 
-        benford = analisar_benford_completo(vals)
+    for chave, grupo in tqdm(grupos, desc="Clusters", unit="cluster"):
+        idx  = grupo.index.to_numpy()
+        vals = grupo[coluna_valor].to_numpy()
+
+        digitos_cluster = {k: v[idx] for k, v in digitos_globais.items()}
+        benford         = analisar_benford_completo(vals, digitos_vetorizados=digitos_cluster)
+
         taxa_outliers = outlier_mask[idx].mean()
-        mad_d1 = benford["d1"].mad
+        mad_d1        = benford["d1"].mad
+        alto_risco    = (mad_d1 > limiar_mad) and (taxa_outliers > limiar_taxa_outliers)
 
-        alto_risco = (mad_d1 > limiar_mad) and (taxa_outliers > limiar_taxa_outliers)
+        if alto_risco:
+            n_alto_risco += 1
 
         chave_t = chave if isinstance(chave, tuple) else (chave,)
         resultados[chave_t] = ClusterResult(
@@ -298,6 +361,7 @@ def analisar_clusters(
             benford_d1=benford["d1"],
         )
 
+    log.info("    Clusters: %d total, %d alto risco", len(resultados), n_alto_risco)
     return resultados
 
 
@@ -306,19 +370,21 @@ def mapear_cluster_risco(
     colunas_cluster: list[str],
     cluster_results: dict[tuple, ClusterResult],
 ) -> np.ndarray:
-    """Retorna array bool indicando se cada linha pertence a cluster de alto risco."""
-    alto_risco = np.zeros(len(df), dtype=bool)
-    for chave, res in cluster_results.items():
-        mask = np.ones(len(df), dtype=bool)
-        for col, val in zip(colunas_cluster, chave):
-            mask &= df[col].values == val
-        if res.alto_risco:
-            alto_risco[mask] = True
-    return alto_risco
+    """
+    Mapeia alto_risco de volta para o DataFrame via merge vetorizado,
+    em vez de iterar sobre cada cluster com máscara booleana.
+    """
+    mapa = {chave: res.alto_risco for chave, res in cluster_results.items()}
+
+    chave_col = df[colunas_cluster].apply(
+        lambda row: tuple(row) if len(colunas_cluster) > 1 else (row.iloc[0],),
+        axis=1,
+    )
+    return chave_col.map(mapa).fillna(False).to_numpy(dtype=bool)
 
 
 # ─────────────────────────────────────────────
-# ETAPA 9 — SCORE FINAL
+# ETAPA 8 — SCORE FINAL
 # ─────────────────────────────────────────────
 
 def calcular_scores(
@@ -330,7 +396,6 @@ def calcular_scores(
     weights: dict = WEIGHTS,
 ) -> tuple[np.ndarray, np.ndarray]:
 
-    # flag_benford normalizado em [0,1]: máximo é 4 níveis
     flag_norm = flags_benford / 4.0
 
     raw = (
@@ -341,7 +406,7 @@ def calcular_scores(
       + weights["w5"] * cluster_risco.astype(float)
     )
 
-    mn, mx = raw.min(), raw.max()
+    mn, mx     = raw.min(), raw.max()
     norm_score = (raw - mn) / (mx - mn + 1e-12)
 
     return raw, norm_score
@@ -353,6 +418,14 @@ def classificar(score: float) -> str:
     elif score >= 0.4:
         return "SUSPEITA"
     return "NORMAL"
+
+
+def _classificar_array(norm_score: np.ndarray) -> np.ndarray:
+    """Versão vetorizada de classificar() — evita loop Python."""
+    result = np.full(len(norm_score), "NORMAL", dtype=object)
+    result[norm_score >= 0.4] = "SUSPEITA"
+    result[norm_score >= 0.7] = "ALTA SUSPEITA"
+    return result
 
 
 # ─────────────────────────────────────────────
@@ -378,41 +451,82 @@ def detectar_fraude(
     df_result : DataFrame original enriquecido com todas as flags e scores.
     metricas  : dicionário com resultados agregados (Benford, clusters, normalidade).
     """
-    # — Pré-processamento
-    df = preprocessar(df, coluna_valor)
-    X = df[coluna_valor].values
+    t_total = time.perf_counter()
+    bar = tqdm(total=7, desc="Pipeline", unit="etapa", ncols=80, leave=True)
 
-    # — Outliers
-    outlier_iqr, outlier_z, outlier_mad_arr = detectar_outliers(X)
+    def step(label: str) -> None:
+        bar.set_postfix_str(label)
+        bar.update(1)
 
-    # — Normalidade
-    norm_result = testar_normalidade(X)
+    # ── 1. Pré-processamento ──────────────────────────────────────────
+    step("pré-processamento")
+    with _cronometrar("Pré-processamento"):
+        df = preprocessar(df, coluna_valor)
+        X  = df[coluna_valor].values
 
-    # — Benford global
-    benford_global = analisar_benford_completo(X.tolist())
+    # ── 2. Extração de dígitos (uma única vez para todo o array) ──────
+    step("extração de dígitos")
+    with _cronometrar("Extração de dígitos"):
+        digitos_globais = _extrair_digitos_vetorizado(X)
+        log.info("    Arrays extraídos: d1, d2, d12, last — %d registros", len(X))
 
-    # — Flags por transação
-    flags_benford = np.array([
-        flag_benford_transacao(v, benford_global) for v in X
-    ])
+    # ── 3. Outliers ───────────────────────────────────────────────────
+    step("outliers")
+    with _cronometrar("Outliers"):
+        outlier_iqr, outlier_z, outlier_mad_arr = detectar_outliers(X)
 
-    # — Clusters
-    if colunas_cluster and all(c in df.columns for c in colunas_cluster):
-        outlier_any = outlier_iqr | outlier_z | outlier_mad_arr
-        cluster_results = analisar_clusters(
-            df, colunas_cluster, coluna_valor, outlier_any
+    # ── 4. Normalidade ────────────────────────────────────────────────
+    step("normalidade")
+    with _cronometrar("Normalidade"):
+        norm_result = testar_normalidade(X)
+
+    # ── 5. Benford global + flags vetorizados ─────────────────────────
+    step("benford global + flags")
+    with _cronometrar("Benford global"):
+        benford_global = analisar_benford_completo(X, digitos_vetorizados=digitos_globais)
+        for nivel, res in benford_global.items():
+            log.info("    [%s] MAD=%.5f  χ²=%.2f  p=%.4f  suspeitos=%s  desvio=%s",
+                     nivel.upper(), res.mad, res.chi2_stat, res.chi2_pvalue,
+                     res.digitos_suspeitos, res.desvio)
+
+    with _cronometrar("Flags Benford por transação (vetorizado)"):
+        flags_benford = calcular_flags_benford_vetorizado(digitos_globais, benford_global)
+        log.info("    Transações com flag > 0: %d (%.1f%%)",
+                 (flags_benford > 0).sum(), (flags_benford > 0).mean() * 100)
+
+    # ── 6. Clusters ───────────────────────────────────────────────────
+    step("clusters")
+    with _cronometrar("Clusters"):
+        if colunas_cluster and all(c in df.columns for c in colunas_cluster):
+            outlier_any = outlier_iqr | outlier_z | outlier_mad_arr
+            log.info("    Agrupando por: %s — %d grupos únicos",
+                     colunas_cluster,
+                     df.groupby(colunas_cluster).ngroups)
+            cluster_results = analisar_clusters(
+                df, colunas_cluster, coluna_valor, outlier_any, digitos_globais
+            )
+            cluster_risco = mapear_cluster_risco(df, colunas_cluster, cluster_results)
+            log.info("    Registros em cluster alto risco: %d (%.1f%%)",
+                     cluster_risco.sum(), cluster_risco.mean() * 100)
+        else:
+            log.info("    Clusters ignorados (sem colunas de cluster válidas).")
+            cluster_results = {}
+            cluster_risco   = np.zeros(len(df), dtype=bool)
+
+    # ── 7. Score final e classificação ────────────────────────────────
+    step("score + classificação")
+    with _cronometrar("Score final"):
+        raw, norm_score = calcular_scores(
+            outlier_iqr, outlier_z, outlier_mad_arr, flags_benford, cluster_risco
         )
-        cluster_risco = mapear_cluster_risco(df, colunas_cluster, cluster_results)
-    else:
-        cluster_results = {}
-        cluster_risco = np.zeros(len(df), dtype=bool)
+        classificacao = _classificar_array(norm_score)
+        for cls in ["ALTA SUSPEITA", "SUSPEITA", "NORMAL"]:
+            n = (classificacao == cls).sum()
+            log.info("    %s: %d (%.1f%%)", cls, n, n / len(df) * 100)
 
-    # — Score final
-    raw, norm_score = calcular_scores(
-        outlier_iqr, outlier_z, outlier_mad_arr, flags_benford, cluster_risco
-    )
+    bar.close()
 
-    # — Montar resultado
+    # ── Montar resultado ──────────────────────────────────────────────
     df_result = df.copy()
     df_result["outlier_iqr"]        = outlier_iqr
     df_result["outlier_z"]          = outlier_z
@@ -421,7 +535,7 @@ def detectar_fraude(
     df_result["cluster_alto_risco"] = cluster_risco
     df_result["score_raw"]          = raw
     df_result["score_norm"]         = norm_score
-    df_result["classificacao"]      = [classificar(s) for s in norm_score]
+    df_result["classificacao"]      = classificacao
 
     metricas = dict(
         normalidade=norm_result,
@@ -430,6 +544,7 @@ def detectar_fraude(
         clusters=cluster_results,
     )
 
+    log.info("Pipeline completo em %.2fs", time.perf_counter() - t_total)
     return df_result, metricas
 
 
@@ -444,13 +559,11 @@ def imprimir_relatorio(df_result: pd.DataFrame, metricas: dict) -> None:
     print("  RELATÓRIO DE DETECÇÃO DE FRAUDE")
     print(sep)
 
-    # Normalidade
     n = metricas["normalidade"]
     print(f"\n📊 NORMALIDADE")
     print(f"   Shapiro p={n['p_shapiro']:.4f} | KS p={n['p_ks']:.4f} | "
           f"Normal={'✅' if n['normal'] else '❌'}")
 
-    # Benford global
     print(f"\n🔢 BENFORD MULTI-DÍGITO (Global)")
     for nivel, res in metricas["benford_global"].items():
         status = "🚨" if res.desvio else "✅"
@@ -459,14 +572,12 @@ def imprimir_relatorio(df_result: pd.DataFrame, metricas: dict) -> None:
               f"Suspeitos={res.digitos_suspeitos}  {status}")
     print(f"\n   Desvio global: {'🚨 SIM' if metricas['benford_desvio'] else '✅ NÃO'}")
 
-    # Outliers
     print(f"\n⚠️  OUTLIERS")
     for col, label in [("outlier_iqr", "IQR"), ("outlier_z", "Z  "), ("outlier_mad", "MAD")]:
         n_out = df_result[col].sum()
         pct   = df_result[col].mean() * 100
         print(f"   {label}: {n_out:6,} ({pct:.1f}%)")
 
-    # Clusters
     clusters = metricas.get("clusters", {})
     if clusters:
         n_risco = sum(1 for c in clusters.values() if c.alto_risco)
@@ -477,35 +588,27 @@ def imprimir_relatorio(df_result: pd.DataFrame, metricas: dict) -> None:
                   f"outliers={c.taxa_outliers*100:5.1f}% | "
                   f"MAD_d1={c.mad_d1:.5f} | {status}")
 
-    # Classificação final
     print(f"\n🎯 CLASSIFICAÇÃO FINAL")
     for cls in ["ALTA SUSPEITA", "SUSPEITA", "NORMAL"]:
         n_cls = (df_result["classificacao"] == cls).sum()
         print(f"   {cls:14s}: {n_cls:7,} ({n_cls/len(df_result)*100:.1f}%)")
 
-    # Top suspeitos
     top = (df_result[df_result["classificacao"] == "ALTA SUSPEITA"]
            .sort_values("score_norm", ascending=False)
            .head(15))
 
     if not top.empty:
         print(f"\n🔴 TOP SUSPEITOS")
-
-        # Colunas de identificação — exibe as que existirem
-        ID_COLS = ["fonte", "favorecido", "cpf_cnpj", "orgao", "ano"]
+        ID_COLS    = ["fonte", "favorecido", "cpf_cnpj", "orgao", "ano"]
         SCORE_COLS = ["valor", "score_norm", "flag_benford",
                       "outlier_iqr", "outlier_z", "outlier_mad"]
-
-        cols = [c for c in ID_COLS + SCORE_COLS if c in top.columns]
-
-        # Formatar valor em notação humana (R$ 100.4 M em vez de 1.004620e+08)
+        cols    = [c for c in ID_COLS + SCORE_COLS if c in top.columns]
         display = top[cols].copy()
         if "valor" in display.columns:
             display["valor"] = display["valor"].apply(
                 lambda v: f"R$ {v/1_000_000:.2f} M" if v >= 1_000_000
                 else (f"R$ {v/1_000:.1f} k" if v >= 1_000 else f"R$ {v:.2f}")
             )
-
         print(display.to_string(index=False))
 
     print(f"\n{sep}\n")
@@ -521,28 +624,20 @@ def gerar_dataset_simulado(
     digito_forcado: int = 9,
     seed: int = 42,
 ) -> pd.DataFrame:
-    """
-    Gera DataFrame simulado com colunas extras para teste de clusters.
-    """
+    """Gera DataFrame simulado com colunas extras para teste de clusters."""
     rng = np.random.default_rng(seed)
-
     valores = rng.lognormal(mean=8, sigma=1.2, size=qtd).tolist()
 
-    # Injetar fraude
     idx_fraude = rng.choice(qtd, int(qtd * percentual_fraude), replace=False)
     for i in idx_fraude:
         s = str(int(valores[i]))
         valores[i] = float(str(digito_forcado) + s[1:]) if len(s) > 1 else float(digito_forcado)
 
-    orgaos   = rng.choice(["MEC", "MS", "MDR", "MF"], size=qtd)
-    anos     = rng.choice([2021, 2022, 2023, 2024], size=qtd)
-    funcoes  = rng.choice(["Educação", "Saúde", "Infraestrutura", "Defesa"], size=qtd)
-
     return pd.DataFrame(dict(
-        valor=valores,
-        orgao=orgaos,
-        ano=anos,
-        funcao=funcoes,
+        valor  = valores,
+        orgao  = rng.choice(["MEC", "MS", "MDR", "MF"], size=qtd),
+        ano    = rng.choice([2021, 2022, 2023, 2024], size=qtd),
+        funcao = rng.choice(["Educação", "Saúde", "Infraestrutura", "Defesa"], size=qtd),
     ))
 
 
@@ -551,9 +646,14 @@ def gerar_dataset_simulado(
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)-8s  %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
     print("Gerando dataset simulado...")
     df = gerar_dataset_simulado(qtd=3000, percentual_fraude=0.18, digito_forcado=9)
-
     print(f"Total de registros: {len(df)}")
     print(df.head())
 
@@ -565,7 +665,6 @@ if __name__ == "__main__":
 
     imprimir_relatorio(df_result, metricas)
 
-    # Exportar CSV
     output_csv = "resultado_fraude.csv"
     df_result.to_csv(output_csv, index=False)
     print(f"Resultado exportado para: {output_csv}")
