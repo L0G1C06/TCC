@@ -53,20 +53,11 @@ class BronzeInspector:
         self._conn = DataLakeConfig.connect()
 
     def inspect(self, dataset_path: str) -> list[DatasetSchema]:
-        """
-        Inspeciona todos os módulos de um dataset.
-        Retorna um DatasetSchema por módulo encontrado.
-        """
         pm = self._scanner.scan(dataset_path)
         schemas = []
 
         for modulo in pm.modulos:
-            # pega o primeiro ano/mês disponível pra ler um sample
-            ano = pm.anos(modulo)[0]
-            mes = pm.meses(modulo, ano)[0]
-
-            columns = self._read_schema(dataset_path, modulo, ano, mes)
-
+            columns = self._read_schema(dataset_path, modulo, pm.is_flat(modulo))
             schemas.append(DatasetSchema(
                 dataset=dataset_path,
                 modulo=modulo,
@@ -85,24 +76,19 @@ class BronzeInspector:
 
     # ── Interno ────────────────────────────────────────────────────────
 
-    def _read_schema(
-            self,
-            dataset_path: str,
-            modulo: str,
-            ano: str,
-            mes: str,
-    ) -> list[ColumnInfo]:
-        """Lê 0 linhas de um parquet só pra pegar o schema."""
-        s3_glob = (
+    def _read_schema(self, dataset_path: str, modulo: str, flat: bool) -> list[ColumnInfo]:
+        base = (
             f"s3://{DataLakeConfig.BUCKET}"
             f"/data/{dataset_path.rstrip('/')}"
-            f"/modulo={modulo}/ano={ano}/mes={mes}"
-            f"/*.parquet"
+            f"/modulo={modulo}"
         )
+        # flat: arquivos direto no módulo; hive: desce recursivamente
+        s3_glob = f"{base}/*.parquet" if flat else f"{base}/**/*.parquet"
+
         try:
             rel = self._conn.sql(
                 f"SELECT * FROM read_parquet('{s3_glob}', "
-                f"hive_partitioning=true) LIMIT 0"
+                f"hive_partitioning=true, union_by_name=true) LIMIT 0"
             )
             return [
                 ColumnInfo(name=name, raw_type=str(dtype))
