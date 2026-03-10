@@ -39,7 +39,7 @@ class OperacoesExportacao(DuckDBModel):
     """
 
     dataset_path = "bndes/parquet/"
-    modulo       = "operacoes-de-exportacaoo-pre-e-pos-embarque"
+    modulo       = "operacoes-de-exportacao-pre-e-pos-embarque"
 
     # ── Exportador (pré/pós-embarque) ─────────────────────────────────
     exportador = StringField(

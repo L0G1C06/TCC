@@ -438,7 +438,7 @@ def detectar_fraude(
 # ─────────────────────────────────────────────
 
 def imprimir_relatorio(df_result: pd.DataFrame, metricas: dict) -> None:
-    sep = "=" * 60
+    sep = "=" * 65
 
     print(f"\n{sep}")
     print("  RELATÓRIO DE DETECÇÃO DE FRAUDE")
@@ -457,38 +457,56 @@ def imprimir_relatorio(df_result: pd.DataFrame, metricas: dict) -> None:
         print(f"   [{nivel.upper():4s}] MAD={res.mad:.5f}  "
               f"χ²={res.chi2_stat:.2f}  p={res.chi2_pvalue:.4f}  "
               f"Suspeitos={res.digitos_suspeitos}  {status}")
-
-    print(f"\n   Desvio global Benford: {'🚨 SIM' if metricas['benford_desvio'] else '✅ NÃO'}")
+    print(f"\n   Desvio global: {'🚨 SIM' if metricas['benford_desvio'] else '✅ NÃO'}")
 
     # Outliers
     print(f"\n⚠️  OUTLIERS")
-    print(f"   IQR : {df_result['outlier_iqr'].sum():4d} ({df_result['outlier_iqr'].mean()*100:.1f}%)")
-    print(f"   Z   : {df_result['outlier_z'].sum():4d} ({df_result['outlier_z'].mean()*100:.1f}%)")
-    print(f"   MAD : {df_result['outlier_mad'].sum():4d} ({df_result['outlier_mad'].mean()*100:.1f}%)")
+    for col, label in [("outlier_iqr", "IQR"), ("outlier_z", "Z  "), ("outlier_mad", "MAD")]:
+        n_out = df_result[col].sum()
+        pct   = df_result[col].mean() * 100
+        print(f"   {label}: {n_out:6,} ({pct:.1f}%)")
 
     # Clusters
-    if metricas["clusters"]:
-        print(f"\n🗂️  CLUSTERS")
-        for chave, c in metricas["clusters"].items():
+    clusters = metricas.get("clusters", {})
+    if clusters:
+        n_risco = sum(1 for c in clusters.values() if c.alto_risco)
+        print(f"\n🗂️  CLUSTERS — {len(clusters)} total, {n_risco} alto risco")
+        for chave, c in sorted(clusters.items(), key=lambda x: x[1].mad_d1, reverse=True)[:15]:
             status = "🚨 ALTO RISCO" if c.alto_risco else "✅ Normal"
-            print(f"   {chave} | n={c.n} | outliers={c.taxa_outliers*100:.1f}% | "
+            print(f"   {str(chave)[:55]:55s} | n={c.n:5d} | "
+                  f"outliers={c.taxa_outliers*100:5.1f}% | "
                   f"MAD_d1={c.mad_d1:.5f} | {status}")
 
     # Classificação final
     print(f"\n🎯 CLASSIFICAÇÃO FINAL")
     for cls in ["ALTA SUSPEITA", "SUSPEITA", "NORMAL"]:
         n_cls = (df_result["classificacao"] == cls).sum()
-        print(f"   {cls:14s}: {n_cls:5d} ({n_cls/len(df_result)*100:.1f}%)")
+        print(f"   {cls:14s}: {n_cls:7,} ({n_cls/len(df_result)*100:.1f}%)")
 
     # Top suspeitos
     top = (df_result[df_result["classificacao"] == "ALTA SUSPEITA"]
            .sort_values("score_norm", ascending=False)
-           .head(10))
+           .head(15))
+
     if not top.empty:
-        print(f"\n🔴 TOP SUSPEITOS (score_norm desc)")
-        cols = ["valor", "score_norm", "flag_benford", "outlier_iqr", "outlier_z", "outlier_mad"]
-        cols = [c for c in cols if c in top.columns]
-        print(top[cols].to_string(index=True))
+        print(f"\n🔴 TOP SUSPEITOS")
+
+        # Colunas de identificação — exibe as que existirem
+        ID_COLS = ["fonte", "favorecido", "cpf_cnpj", "orgao", "ano"]
+        SCORE_COLS = ["valor", "score_norm", "flag_benford",
+                      "outlier_iqr", "outlier_z", "outlier_mad"]
+
+        cols = [c for c in ID_COLS + SCORE_COLS if c in top.columns]
+
+        # Formatar valor em notação humana (R$ 100.4 M em vez de 1.004620e+08)
+        display = top[cols].copy()
+        if "valor" in display.columns:
+            display["valor"] = display["valor"].apply(
+                lambda v: f"R$ {v/1_000_000:.2f} M" if v >= 1_000_000
+                else (f"R$ {v/1_000:.1f} k" if v >= 1_000 else f"R$ {v:.2f}")
+            )
+
+        print(display.to_string(index=False))
 
     print(f"\n{sep}\n")
 
