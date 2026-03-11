@@ -9,10 +9,8 @@ ENCODING = "utf-8"
 
 NOMES_ALVO = [
     "odebrecht",
-    "oas",
     "andrade gutierrez",
     "camargo correa",
-    "camargo corrêa",
     "utc engenharia",
 ]
 
@@ -91,7 +89,7 @@ def buscar_nomes(csv_path):
 
             # Filtra apenas classificações alvo
             classif_normalizada = chunk[col_classif].str.lower().str.strip() if col_classif else None
-            mask_classif = classif_normalizada.isin({"suspeita", "alta suspeita"}) if col_classif else pd.Series([True] * len(chunk))
+            mask_classif = classif_normalizada.isin({"normal", "suspeita", "alta suspeita"}) if col_classif else pd.Series([True] * len(chunk))
 
             # Busca por cada nome (contains = busca parcial)
             for nome in NOMES_ALVO:
