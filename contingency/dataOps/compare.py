@@ -84,6 +84,11 @@ def buscar_nomes(csv_path):
             # Normaliza nome para busca (lowercase, sem acento não é necessário pois fazemos contains)
             nome_normalizado = chunk[col_nome].str.lower().str.strip().fillna("")
 
+            # Filtra anos da Operação Lava Jato (2007-2016)
+            mask_ano = pd.to_numeric(chunk["ano"], errors="coerce").between(2007, 2016)
+            chunk = chunk[mask_ano]
+            nome_normalizado = chunk[col_nome].str.lower().str.strip().fillna("")
+
             # Filtra apenas classificações alvo
             classif_normalizada = chunk[col_classif].str.lower().str.strip() if col_classif else None
             mask_classif = classif_normalizada.isin({"suspeita", "alta suspeita"}) if col_classif else pd.Series([True] * len(chunk))
