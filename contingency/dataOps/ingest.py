@@ -1,10 +1,11 @@
 """
-ingest.py — Baixa todas as fontes do S3 e persiste no DuckDB local.
+ingest.py — Baixa todas as fontes do S3 e persiste no DuckDB local em chunks.
 
 Uso:
     python3 ingest.py                        # ingere tudo
     python3 ingest.py --fonte cpgf           # ingere só uma fonte
     python3 ingest.py --force                # reingere mesmo que já exista
+    python3 ingest.py --chunk-size 200000    # ajusta RAM por chunk (padrão 500k)
 
 Fontes disponíveis: cpgf, ceis, licitacoes, viagens, compras,
                     bndes_financiamento, bndes_exportacao
@@ -19,7 +20,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator
 
 import duckdb
 import pandas as pd
@@ -48,7 +49,7 @@ log = logging.getLogger(__name__)
 
 # ── Configuração ─────────────────────────────────────────────────────────────
 
-DB_PATH = Path(__file__).resolve().parent / "pipeline.duckdb"
+DB_PATH   = Path(__file__).resolve().parent / "pipeline.duckdb"
 
 S3_BUCKET = os.getenv("DATALAKE_BUCKET", "storage-rumolog")
 S3_BASE   = f"s3://{S3_BUCKET}/data/portal_da_transparencia/parquet"
@@ -73,6 +74,8 @@ BNDES_EXP_PREFIXES = [
     "operacoes-de-exportacao",
 ]
 
+CHUNK_SIZE = 500_000  # registros por chunk — reduza se a RAM esgotar
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS dados (
     valor       DOUBLE,
@@ -88,7 +91,6 @@ CREATE TABLE IF NOT EXISTS dados (
 # ── Helpers de dados ─────────────────────────────────────────────────────────
 
 def normalizar_br(series: pd.Series) -> pd.Series:
-    """Converte valores monetários em formato BR (1.234,56) para float."""
     if pd.api.types.is_numeric_dtype(series):
         return pd.to_numeric(series, errors="coerce")
     return (
@@ -101,7 +103,6 @@ def normalizar_br(series: pd.Series) -> pd.Series:
 
 
 def extrair_ano(series: pd.Series) -> pd.Series:
-    """Extrai o ano de uma série de datas em formatos variados."""
     parsed = pd.to_datetime(series, dayfirst=True, errors="coerce")
     fallback_mask = parsed.isna()
     if fallback_mask.any():
@@ -112,7 +113,6 @@ def extrair_ano(series: pd.Series) -> pd.Series:
 
 
 def primeira_coluna(df: pd.DataFrame, *candidatas: str, default=None) -> pd.Series:
-    """Retorna a primeira coluna encontrada no DataFrame entre as candidatas."""
     for col in candidatas:
         if col in df.columns:
             return df[col]
@@ -120,7 +120,6 @@ def primeira_coluna(df: pd.DataFrame, *candidatas: str, default=None) -> pd.Seri
 
 
 def primeiro_valor_valido(df: pd.DataFrame, *candidatas: str) -> pd.Series | None:
-    """Retorna a primeira coluna de valor monetário válida (com ao menos um não-nulo)."""
     for col in candidatas:
         if col in df.columns:
             series = normalizar_br(df[col])
@@ -140,7 +139,6 @@ def unificar(
     cnpj: pd.Series,
     fonte: str,
 ) -> pd.DataFrame:
-    """Normaliza um DataFrame para o schema unificado da tabela `dados`."""
     return pd.DataFrame({
         "valor":      valor,
         "orgao":      orgao,
@@ -155,7 +153,6 @@ def unificar(
 # ── Helpers de infraestrutura ─────────────────────────────────────────────────
 
 def get_s3_conn() -> duckdb.DuckDBPyConnection:
-    """Cria uma conexão DuckDB com credenciais S3 configuradas."""
     conn = duckdb.connect()
     conn.execute(f"""
         INSTALL httpfs; LOAD httpfs;
@@ -167,14 +164,12 @@ def get_s3_conn() -> duckdb.DuckDBPyConnection:
 
 
 def get_db() -> duckdb.DuckDBPyConnection:
-    """Abre (ou cria) o banco local e garante que o schema existe."""
     db = duckdb.connect(str(DB_PATH))
     db.execute(SCHEMA_SQL)
     return db
 
 
 def fonte_ja_ingerida(fonte: str) -> bool:
-    """Verifica se uma fonte já possui registros no banco local."""
     with get_db() as db:
         count = db.execute(
             "SELECT COUNT(*) FROM dados WHERE fonte = ?", [fonte]
@@ -182,18 +177,53 @@ def fonte_ja_ingerida(fonte: str) -> bool:
     return count > 0
 
 
-def gravar(df: pd.DataFrame, fonte: str) -> None:
-    """Substitui os registros da fonte no banco local (delete + insert)."""
+def _em_chunks(df: pd.DataFrame, chunk_size: int) -> Iterator[pd.DataFrame]:
+    """Divide um DataFrame em fatias de tamanho fixo."""
+    for start in range(0, len(df), chunk_size):
+        yield df.iloc[start : start + chunk_size]
+
+
+def gravar_stream(
+    stream: Iterator[pd.DataFrame],
+    fonte: str,
+    chunk_size: int,
+) -> int:
+    """
+    Grava um iterador de DataFrames no DuckDB chunk a chunk.
+
+    - Apaga registros anteriores da fonte apenas antes do 1º chunk.
+    - Cada chunk é inserido e deletado da RAM antes do próximo.
+    - Retorna o total de registros gravados.
+    """
+    total    = 0
+    primeiro = True
+
+    with get_db() as db:
+        for chunk in stream:
+            if chunk.empty:
+                del chunk
+                continue
+            if primeiro:
+                db.execute("DELETE FROM dados WHERE fonte = ?", [fonte])
+                primeiro = False
+            db.execute("INSERT INTO dados SELECT * FROM chunk")
+            total += len(chunk)
+            log.debug("    chunk inserido: %d linhas (acumulado: %d)", len(chunk), total)
+            del chunk  # libera RAM antes do próximo
+
+    return total
+
+
+def gravar(df: pd.DataFrame, fonte: str, chunk_size: int = CHUNK_SIZE) -> None:
+    """Grava um DataFrame completo em chunks — nunca faz INSERT de tudo de uma vez."""
     if df.empty:
         log.warning("DataFrame vazio para fonte '%s' — nada gravado.", fonte)
         return
-    with get_db() as db:
-        db.execute("DELETE FROM dados WHERE fonte = ?", [fonte])
-        db.execute("INSERT INTO dados SELECT * FROM df")
+    total = gravar_stream(_em_chunks(df, chunk_size), fonte, chunk_size)
+    log.info("%s: %d registros gravados.", fonte, total)
 
 
 def ler_parquet_s3(conn: duckdb.DuckDBPyConnection, path: str) -> pd.DataFrame:
-    """Lê um arquivo Parquet do S3; retorna DataFrame vazio em caso de falha."""
     try:
         return conn.execute(f"SELECT * FROM read_parquet('{path}')").df()
     except Exception as exc:
@@ -202,7 +232,6 @@ def ler_parquet_s3(conn: duckdb.DuckDBPyConnection, path: str) -> pd.DataFrame:
 
 
 def listar_parquets(conn: duckdb.DuckDBPyConnection, prefix: str) -> list[str]:
-    """Lista arquivos Parquet sob um prefixo S3."""
     try:
         rows = conn.execute(f"SELECT file FROM glob('{prefix}/**/*.parquet')").fetchall()
         return [r[0] for r in rows]
@@ -212,42 +241,57 @@ def listar_parquets(conn: duckdb.DuckDBPyConnection, prefix: str) -> list[str]:
 
 # ── Ingestores ────────────────────────────────────────────────────────────────
 
-def ingerir_cpgf() -> None:
+def ingerir_cpgf(chunk_size: int = CHUNK_SIZE) -> None:
+    """CPGF: grava mês a mês direto no DuckDB — nunca acumula todos os anos."""
     fonte = "CPGF"
     log.info("Iniciando ingestão: %s", fonte)
-    partes: list[pd.DataFrame] = []
+    total    = 0
+    primeiro = True
 
-    for ano in ANOS_CPGF:
-        for mes in MESES:
-            try:
-                df_pl = CPGF.polars(ano=ano, mes=mes).collect()
-                if df_pl.is_empty():
-                    continue
-                df = df_pl.to_pandas()
-                partes.append(unificar(
-                    df,
-                    valor      = normalizar_br(df["VALOR TRANSAÇÃO"]),
-                    orgao      = primeira_coluna(df, "NOME ÓRGÃO SUPERIOR"),
-                    ano        = pd.to_numeric(df["ANO EXTRATO"], errors="coerce").astype("Int64"),
-                    funcao     = primeira_coluna(df, "NOME ÓRGÃO"),
-                    favorecido = primeira_coluna(df, "NOME FAVORECIDO"),
-                    cnpj       = primeira_coluna(df, "CNPJ OU CPF FAVORECIDO"),
-                    fonte      = fonte,
-                ))
-                log.debug("  %s/%s → %d registros", ano, mes, len(partes[-1]))
-            except Exception as exc:
-                log.debug("  %s/%s ignorado: %s", ano, mes, type(exc).__name__)
+    with get_db() as db:
+        for ano in ANOS_CPGF:
+            for mes in MESES:
+                try:
+                    df_pl = CPGF.polars(ano=ano, mes=mes).collect()
+                    if df_pl.is_empty():
+                        continue
+                    df = df_pl.to_pandas()
+                    del df_pl
 
-    if not partes:
+                    chunk = unificar(
+                        df,
+                        valor      = normalizar_br(df["VALOR TRANSAÇÃO"]),
+                        orgao      = primeira_coluna(df, "NOME ÓRGÃO SUPERIOR"),
+                        ano        = pd.to_numeric(df["ANO EXTRATO"], errors="coerce").astype("Int64"),
+                        funcao     = primeira_coluna(df, "NOME ÓRGÃO"),
+                        favorecido = primeira_coluna(df, "NOME FAVORECIDO"),
+                        cnpj       = primeira_coluna(df, "CNPJ OU CPF FAVORECIDO"),
+                        fonte      = fonte,
+                    )
+                    del df
+
+                    # Sub-chunka caso o mês seja muito grande
+                    for sub in _em_chunks(chunk, chunk_size):
+                        if primeiro:
+                            db.execute("DELETE FROM dados WHERE fonte = ?", [fonte])
+                            primeiro = False
+                        db.execute("INSERT INTO dados SELECT * FROM sub")
+                        total += len(sub)
+                        del sub
+
+                    log.debug("  %s/%s gravado (total: %d)", ano, mes, total)
+                    del chunk
+
+                except Exception as exc:
+                    log.debug("  %s/%s ignorado: %s", ano, mes, type(exc).__name__)
+
+    if total == 0:
         log.warning("%s: nenhum dado carregado.", fonte)
-        return
-
-    result = pd.concat(partes, ignore_index=True)
-    gravar(result, fonte)
-    log.info("%s: %d registros gravados.", fonte, len(result))
+    else:
+        log.info("%s: %d registros gravados.", fonte, total)
 
 
-def ingerir_ceis() -> None:
+def ingerir_ceis(chunk_size: int = CHUNK_SIZE) -> None:
     fonte = "CEIS"
     log.info("Iniciando ingestão: %s", fonte)
     try:
@@ -262,8 +306,9 @@ def ingerir_ceis() -> None:
             cnpj       = primeira_coluna(df, "CPF OU CNPJ DO SANCIONADO"),
             fonte      = fonte,
         )
-        gravar(result, fonte)
-        log.info("%s: %d registros gravados.", fonte, len(result))
+        del df
+        gravar(result, fonte, chunk_size)
+        del result
     except Exception as exc:
         log.error("%s: %s — %s", fonte, type(exc).__name__, exc)
 
@@ -273,43 +318,57 @@ def _ingerir_particionado(
     anos: list[str],
     prefix_template: str,
     construir_df: Callable[[pd.DataFrame, str], pd.DataFrame | None],
+    chunk_size: int = CHUNK_SIZE,
 ) -> None:
-    """Genérico para fontes particionadas por ano/mês no S3."""
+    """
+    Genérico para fontes particionadas por ano/mês no S3.
+    Cada arquivo Parquet é lido, normalizado e gravado individualmente —
+    nunca acumula múltiplos anos/meses na RAM.
+    """
     log.info("Iniciando ingestão: %s", fonte)
-    conn = get_s3_conn()
-    partes: list[pd.DataFrame] = []
+    conn     = get_s3_conn()
+    total    = 0
+    primeiro = True
 
     try:
-        for ano in anos:
-            for mes in MESES:
-                prefix = prefix_template.format(ano=ano, mes=mes)
-                arquivos = listar_parquets(conn, prefix)
-                if not arquivos:
-                    continue
-                sub: list[pd.DataFrame] = []
-                for arq in arquivos:
-                    df = ler_parquet_s3(conn, arq)
-                    resultado = construir_df(df, ano)
-                    if resultado is not None and not resultado.empty:
-                        sub.append(resultado)
-                if sub:
-                    parte = pd.concat(sub, ignore_index=True)
-                    partes.append(parte)
-                    log.debug("  %s/%s → %d registros", ano, mes, len(parte))
+        with get_db() as db:
+            for ano in anos:
+                for mes in MESES:
+                    prefix   = prefix_template.format(ano=ano, mes=mes)
+                    arquivos = listar_parquets(conn, prefix)
+                    if not arquivos:
+                        continue
+
+                    for arq in arquivos:
+                        df        = ler_parquet_s3(conn, arq)
+                        resultado = construir_df(df, ano)
+                        del df
+
+                        if resultado is None or resultado.empty:
+                            del resultado
+                            continue
+
+                        for sub in _em_chunks(resultado, chunk_size):
+                            if primeiro:
+                                db.execute("DELETE FROM dados WHERE fonte = ?", [fonte])
+                                primeiro = False
+                            db.execute("INSERT INTO dados SELECT * FROM sub")
+                            total += len(sub)
+                            del sub
+
+                        log.debug("  %s/%s → %d (total: %d)", ano, mes, len(resultado), total)
+                        del resultado
     finally:
         conn.close()
 
-    if not partes:
+    if total == 0:
         log.warning("%s: nenhuma partição carregada.", fonte)
-        return
-
-    result = pd.concat(partes, ignore_index=True)
-    gravar(result, fonte)
-    log.info("%s: %d registros gravados.", fonte, len(result))
+    else:
+        log.info("%s: %d registros gravados.", fonte, total)
 
 
-def ingerir_licitacoes() -> None:
-    fonte = "LICITACOES"
+def ingerir_licitacoes(chunk_size: int = CHUNK_SIZE) -> None:
+    fonte    = "LICITACOES"
     VAL_COLS = ["Valor Licitação", "Valor Empenho (R$)"]
 
     def construir(df: pd.DataFrame, ano: str) -> pd.DataFrame | None:
@@ -332,15 +391,14 @@ def ingerir_licitacoes() -> None:
         )
 
     _ingerir_particionado(
-        fonte,
-        ANOS_LICITACOES,
+        fonte, ANOS_LICITACOES,
         f"{S3_BASE}/modulo=licitacoes/ano={{ano}}/mes={{mes}}",
-        construir,
+        construir, chunk_size,
     )
 
 
-def ingerir_compras() -> None:
-    fonte = "COMPRAS"
+def ingerir_compras(chunk_size: int = CHUNK_SIZE) -> None:
+    fonte    = "COMPRAS"
     VAL_COLS = [
         "Valor Item", "Valor Inicial Compra", "Valor Final Compra",
         "Valor Apostilamento", "Valor Licitação",
@@ -364,61 +422,77 @@ def ingerir_compras() -> None:
         )
 
     _ingerir_particionado(
-        fonte,
-        ANOS_COMPRAS,
+        fonte, ANOS_COMPRAS,
         f"{S3_BASE}/modulo=compras/ano={{ano}}/mes={{mes}}",
-        construir,
+        construir, chunk_size,
     )
 
 
-def ingerir_viagens() -> None:
-    fonte = "VIAGENS"
+def ingerir_viagens(chunk_size: int = CHUNK_SIZE) -> None:
+    """
+    VIAGENS: cada ano é um arquivo Parquet (~500k–1M linhas).
+    Grava ano a ano direto no DuckDB sem acumular na RAM.
+    """
+    fonte    = "VIAGENS"
     VAL_COLS = ["Valor", "Valor diárias", "Valor passagens"]
     log.info("Iniciando ingestão: %s", fonte)
-    conn = get_s3_conn()
-    partes: list[pd.DataFrame] = []
+    conn     = get_s3_conn()
+    total    = 0
+    primeiro = True
 
     try:
-        for ano in ANOS_VIAGENS:
-            path = f"{S3_BASE}/modulo=viagens/ano={ano}/{ano}_Pagamento.parquet"
-            df = ler_parquet_s3(conn, path)
-            if df.empty:
-                continue
-            val = primeiro_valor_valido(df, *VAL_COLS)
-            if val is None:
-                log.debug("  %s: sem coluna de valor", ano)
-                continue
-            partes.append(unificar(
-                df,
-                valor      = val,
-                orgao      = primeira_coluna(df, "Nome do órgão superior", "Nome do órgao pagador"),
-                ano        = pd.Series([int(ano)] * len(df), dtype="Int64"),
-                funcao     = primeira_coluna(df, "Tipo de pagamento"),
-                favorecido = primeira_coluna(df, "Nome"),
-                cnpj       = primeira_coluna(df, "CPF viajante"),
-                fonte      = fonte,
-            ))
-            log.debug("  %s → %d registros", ano, len(partes[-1]))
+        with get_db() as db:
+            for ano in ANOS_VIAGENS:
+                path = f"{S3_BASE}/modulo=viagens/ano={ano}/{ano}_Pagamento.parquet"
+                df   = ler_parquet_s3(conn, path)
+                if df.empty:
+                    continue
+
+                val = primeiro_valor_valido(df, *VAL_COLS)
+                if val is None:
+                    log.debug("  %s: sem coluna de valor", ano)
+                    del df
+                    continue
+
+                resultado = unificar(
+                    df,
+                    valor      = val,
+                    orgao      = primeira_coluna(df, "Nome do órgão superior", "Nome do órgao pagador"),
+                    ano        = pd.Series([int(ano)] * len(df), dtype="Int64"),
+                    funcao     = primeira_coluna(df, "Tipo de pagamento"),
+                    favorecido = primeira_coluna(df, "Nome"),
+                    cnpj       = primeira_coluna(df, "CPF viajante"),
+                    fonte      = fonte,
+                )
+                del df
+
+                for sub in _em_chunks(resultado, chunk_size):
+                    if primeiro:
+                        db.execute("DELETE FROM dados WHERE fonte = ?", [fonte])
+                        primeiro = False
+                    db.execute("INSERT INTO dados SELECT * FROM sub")
+                    total += len(sub)
+                    del sub
+
+                log.debug("  %s → %d registros (total: %d)", ano, len(resultado), total)
+                del resultado
     finally:
         conn.close()
 
-    if not partes:
+    if total == 0:
         log.warning("%s: nenhuma partição carregada.", fonte)
-        return
-
-    result = pd.concat(partes, ignore_index=True)
-    gravar(result, fonte)
-    log.info("%s: %d registros gravados.", fonte, len(result))
+    else:
+        log.info("%s: %d registros gravados.", fonte, total)
 
 
-def ingerir_bndes_financiamento() -> None:
-    fonte = "BNDES_FINANCIAMENTO"
+def ingerir_bndes_financiamento(chunk_size: int = CHUNK_SIZE) -> None:
+    fonte    = "BNDES_FINANCIAMENTO"
     VAL_COLS = ["valor_desembolsado_reais", "valor_contratado_reais", "valor_da_operacao_em_reais"]
     log.info("Iniciando ingestão: %s", fonte)
     try:
         files_literal = "', '".join(BNDES_FIN_FILES)
         conn = get_s3_conn()
-        df = conn.execute(
+        df   = conn.execute(
             f"SELECT * FROM read_parquet(['{files_literal}'], union_by_name=true)"
         ).df()
         conn.close()
@@ -437,18 +511,19 @@ def ingerir_bndes_financiamento() -> None:
             cnpj       = primeira_coluna(df, "cpf_cnpj", "cnpj"),
             fonte      = fonte,
         )
-        gravar(result, fonte)
-        log.info("%s: %d registros gravados.", fonte, len(result))
+        del df
+        gravar(result, fonte, chunk_size)
+        del result
     except Exception as exc:
         log.error("%s: %s — %s", fonte, type(exc).__name__, exc)
 
 
-def ingerir_bndes_exportacao() -> None:
-    fonte = "BNDES_EXPORTACAO"
+def ingerir_bndes_exportacao(chunk_size: int = CHUNK_SIZE) -> None:
+    fonte    = "BNDES_EXPORTACAO"
     VAL_COLS = ["valor_desembolsado_em_reais", "valor_da_operacao_em_reais"]
     log.info("Iniciando ingestão: %s", fonte)
     conn = get_s3_conn()
-    df = pd.DataFrame()
+    df   = pd.DataFrame()
 
     try:
         for prefix in BNDES_EXP_PREFIXES:
@@ -482,13 +557,14 @@ def ingerir_bndes_exportacao() -> None:
         cnpj       = primeira_coluna(df, "cnpj_do_exportador", "cpf_cnpj"),
         fonte      = fonte,
     )
-    gravar(result, fonte)
-    log.info("%s: %d registros gravados.", fonte, len(result))
+    del df
+    gravar(result, fonte, chunk_size)
+    del result
 
 
 # ── Registro de ingestores ────────────────────────────────────────────────────
 
-INGESTORES: dict[str, Callable[[], None]] = {
+INGESTORES: dict[str, Callable] = {
     "cpgf":                ingerir_cpgf,
     "ceis":                ingerir_ceis,
     "licitacoes":          ingerir_licitacoes,
@@ -503,29 +579,21 @@ INGESTORES: dict[str, Callable[[], None]] = {
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Ingestão S3 → DuckDB local")
-    parser.add_argument(
-        "--fonte",
-        choices=list(INGESTORES.keys()),
-        help="Ingere só uma fonte específica.",
-    )
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Reingere mesmo que a fonte já exista no DB.",
-    )
+    parser.add_argument("--fonte", choices=list(INGESTORES.keys()),
+                        help="Ingere só uma fonte específica.")
+    parser.add_argument("--force", action="store_true",
+                        help="Reingere mesmo que a fonte já exista no DB.")
+    parser.add_argument("--chunk-size", type=int, default=CHUNK_SIZE, dest="chunk_size",
+                        help=f"Registros por chunk ao gravar no DuckDB (padrão {CHUNK_SIZE:,}).")
     return parser.parse_args()
 
 
 def _resumo_db() -> None:
-    """Imprime o estado atual do banco após a ingestão."""
     with get_db() as db:
         rows = db.execute("""
             SELECT fonte, COUNT(*) AS n, MIN(ano) AS ano_min, MAX(ano) AS ano_max
-            FROM dados
-            GROUP BY fonte
-            ORDER BY fonte
+            FROM dados GROUP BY fonte ORDER BY fonte
         """).fetchall()
-
     log.info("Estado atual do DB (%s):", DB_PATH)
     for fonte, n, ano_min, ano_max in rows:
         log.info("  %-28s %10d registros  (%s → %s)", fonte, n, ano_min, ano_max)
@@ -533,9 +601,7 @@ def _resumo_db() -> None:
 
 def main() -> None:
     args = _parse_args()
-
-    # Garante que o DB e a tabela existem antes de qualquer operação
-    get_db().close()
+    get_db().close()  # garante schema
 
     fontes_alvo: list[str] = [args.fonte] if args.fonte else list(INGESTORES.keys())
 
@@ -549,12 +615,15 @@ def main() -> None:
         log.info("Todas as fontes já estão no DB. Nada a fazer.")
         return
 
-    log.info("Ingerindo em paralelo: %s", ", ".join(fontes_alvo))
-    t0 = time.perf_counter()
+    log.info("Ingerindo em paralelo: %s  |  chunk_size=%d", ", ".join(fontes_alvo), args.chunk_size)
+    t0    = time.perf_counter()
     erros: dict[str, str] = {}
 
+    def _chamar(nome: str) -> None:
+        INGESTORES[nome](chunk_size=args.chunk_size)
+
     with ThreadPoolExecutor(max_workers=len(fontes_alvo)) as executor:
-        futures = {executor.submit(INGESTORES[f]): f for f in fontes_alvo}
+        futures = {executor.submit(_chamar, f): f for f in fontes_alvo}
         for future in as_completed(futures):
             nome = futures[future]
             try:
@@ -563,8 +632,7 @@ def main() -> None:
                 erros[nome] = str(exc)
                 log.error("%s falhou: %s", nome, exc)
 
-    elapsed = time.perf_counter() - t0
-    log.info("Ingestão concluída em %.1fs.", elapsed)
+    log.info("Ingestão concluída em %.1fs.", time.perf_counter() - t0)
     _resumo_db()
 
     if erros:

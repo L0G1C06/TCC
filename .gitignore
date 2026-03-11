@@ -252,3 +252,4 @@ data/
 dev.env
 *.parquet
 *.duckdb
+*.csv
