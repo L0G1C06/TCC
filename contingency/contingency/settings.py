@@ -49,8 +49,21 @@ INSTALLED_APPS = [
     'apps.bndes',
     'apps.portal_da_transparencia',
     'apps.datalake',
+    'rest_framework',
+    'drf_spectacular',
 
 ]
+
+REST_FRAMEWORK = {
+    'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
+}
+
+SPECTACULAR_SETTINGS = {
+    'TITLE': 'Datalake Metadata API',
+    'DESCRIPTION': 'API para visualização de metadados de datasets do S3.',
+    'VERSION': '1.0.0',
+    'SERVE_INCLUDE_SCHEMA': False,
+}
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
