@@ -30,7 +30,7 @@ import warnings
 from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Iterator, Optional
+from typing import Iterator, Literal, Optional
 
 import numpy as np
 import pandas as pd
@@ -58,18 +58,41 @@ def _cronometrar(label: str):
 
 WEIGHTS = dict(w1=0.20, w2=0.20, w3=0.20, w4=0.25, w5=0.15)
 
-MAD_THRESHOLDS = dict(d1=0.015, d2=0.012, d12=0.0012, last=0.008)
+# ── PATCH M2: limiares Nigrini 2012 com dois patamares (conforme / alerta / crítico) ──
+# Substituiu o dict plano MAD_THRESHOLDS = dict(d1=0.015, ...) por estrutura aninhada.
+# Mantido MAD_THRESHOLDS_LEGACY para não quebrar código externo que usava o formato antigo.
+MAD_THRESHOLDS: dict[str, dict[str, float]] = {
+    "d1":   {"conforme": 0.006, "alerta": 0.012},
+    "d2":   {"conforme": 0.006, "alerta": 0.010},
+    "d12":  {"conforme": 0.0012,"alerta": 0.0018},
+    "last": {"conforme": 0.006, "alerta": 0.010},
+}
+MAD_THRESHOLDS_LEGACY = dict(d1=0.015, d2=0.012, d12=0.0012, last=0.008)  # compatibilidade
 
 MARGEM_SUSPEITA = 0.02
 ALPHA           = 0.05
-CHUNK_SIZE      = 500_000   # registros por chunk (ajuste conforme RAM disponível)
+CHUNK_SIZE      = 500_000
 CLUSTER_BATCH_SIZE = 50
+
+# ── PATCH M2: tipo do flag tri-estado ─────────────────────────────────────────
+FlagEstado = Literal["conforme", "alerta", "crítico"]
+
+
+def _calcular_flag(mad: float, pvalue: float, nivel: str) -> FlagEstado:
+    """Regra única de classificação: MAD (magnitude) + p-valor (significância)."""
+    t = MAD_THRESHOLDS.get(nivel, MAD_THRESHOLDS["d1"])
+    if mad > t["alerta"] or pvalue < ALPHA / 5:
+        return "crítico"
+    if mad > t["conforme"] or pvalue < ALPHA:
+        return "alerta"
+    return "conforme"
 
 
 # ─────────────────────────────────────────────
 # ESTRUTURAS DE DADOS
 # ─────────────────────────────────────────────
 
+# ── PATCH M2: BenfordResult ganhou js_divergence + flag tri-estado ────────────
 @dataclass
 class BenfordResult:
     mad: float
@@ -79,6 +102,19 @@ class BenfordResult:
     freq_exp: dict
     digitos_suspeitos: list
     desvio: bool
+    # novos campos — opcionais para não quebrar instanciações legadas
+    js_divergence: float = 0.0
+    flag: FlagEstado = "conforme"
+
+    def __post_init__(self) -> None:
+        # Sempre recalcula flag a partir de mad + pvalue para garantir consistência
+        nivel = getattr(self, "_nivel", "d1")
+        self.flag = _calcular_flag(self.mad, self.chi2_pvalue, nivel)
+        self.desvio = self.flag != "conforme"
+
+    @property
+    def emoji(self) -> str:
+        return {"conforme": "✅", "alerta": "⚠️", "crítico": "🚨"}[self.flag]
 
 
 @dataclass
@@ -150,6 +186,58 @@ def freq_esperada_last() -> dict: return _FREQ_EXP["last"]
 
 
 # ─────────────────────────────────────────────
+# NÚCLEO BENFORD
+# ─────────────────────────────────────────────
+
+# ── PATCH M2: _analisar_distribuicao calcula JS + flag tri-estado ─────────────
+def _analisar_distribuicao(valores: np.ndarray, freq_exp: dict, nivel: str) -> BenfordResult:
+    arr   = np.asarray(valores)
+    arr   = arr[arr >= 0]
+    total = len(arr)
+
+    if total == 0:
+        r = BenfordResult(0, 0, 1, {}, freq_exp, [], False)
+        r._nivel = nivel
+        r.__post_init__()
+        return r
+
+    digitos  = sorted(freq_exp.keys())
+    counts   = Counter(arr.tolist())
+    freq_obs = {d: counts.get(d, 0) / total for d in digitos}
+    mad      = float(np.mean([abs(freq_obs[d] - freq_exp[d]) for d in digitos]))
+
+    chi2_stat = sum(
+        ((freq_obs[d] - freq_exp[d]) ** 2) / freq_exp[d]
+        for d in digitos if freq_exp[d] > 0
+    ) * total
+
+    p_value = float(1 - chi2.cdf(chi2_stat, len(digitos) - 1))
+
+    # Jensen-Shannon divergence (simétrica, bounded [0, 1])
+    js = 0.0
+    for d in digitos:
+        m = (freq_obs[d] + freq_exp[d]) / 2
+        if freq_obs[d] > 0 and m > 0:
+            js += freq_obs[d] * math.log2(freq_obs[d] / m)
+        if freq_exp[d] > 0 and m > 0:
+            js += freq_exp[d] * math.log2(freq_exp[d] / m)
+    js_divergence = float(js / 2)
+
+    digitos_suspeitos = [d for d in digitos if abs(freq_obs[d] - freq_exp[d]) > MARGEM_SUSPEITA]
+
+    r = BenfordResult(
+        mad=mad, chi2_stat=chi2_stat, chi2_pvalue=p_value,
+        freq_obs=freq_obs, freq_exp=freq_exp,
+        digitos_suspeitos=digitos_suspeitos,
+        desvio=False,           # recalculado em __post_init__
+        js_divergence=js_divergence,
+    )
+    r._nivel = nivel
+    r.__post_init__()
+    return r
+
+
+# ─────────────────────────────────────────────
 # ACUMULADOR BENFORD — 1ª PASSAGEM (sem guardar dados)
 # ─────────────────────────────────────────────
 
@@ -183,70 +271,66 @@ class BenfordAccumulator:
             self._counts[nivel].update(validos.tolist())
             self._total[nivel] += len(validos)
 
+    # ── PATCH M2: finalizar() agora calcula JS + flag tri-estado ──────────────
     def finalizar(self) -> dict[str, BenfordResult]:
         """Calcula BenfordResult para cada nível a partir das contagens acumuladas."""
         resultados = {}
         for nivel, freq_exp in _FREQ_EXP.items():
             total = self._total[nivel]
             if total == 0:
-                resultados[nivel] = BenfordResult(0, 0, 1, {}, freq_exp, [], False)
+                r = BenfordResult(0, 0, 1, {}, freq_exp, [], False)
+                r._nivel = nivel
+                r.__post_init__()
+                resultados[nivel] = r
                 continue
 
             digitos  = sorted(freq_exp.keys())
             freq_obs = {d: self._counts[nivel].get(d, 0) / total for d in digitos}
-
-            mad = float(np.mean([abs(freq_obs[d] - freq_exp[d]) for d in digitos]))
+            mad      = float(np.mean([abs(freq_obs[d] - freq_exp[d]) for d in digitos]))
 
             chi2_stat = sum(
                 ((freq_obs[d] - freq_exp[d]) ** 2) / freq_exp[d]
                 for d in digitos if freq_exp[d] > 0
             ) * total
 
-            p_value           = 1 - chi2.cdf(chi2_stat, len(digitos) - 1)
-            digitos_suspeitos = [d for d in digitos if freq_obs[d] > freq_exp[d] + MARGEM_SUSPEITA]
-            desvio            = mad > MAD_THRESHOLDS.get(nivel, 0.015) or p_value < ALPHA
+            p_value = float(1 - chi2.cdf(chi2_stat, len(digitos) - 1))
 
-            resultados[nivel] = BenfordResult(
+            # Jensen-Shannon divergence
+            js = 0.0
+            for d in digitos:
+                m = (freq_obs[d] + freq_exp[d]) / 2
+                if freq_obs[d] > 0 and m > 0:
+                    js += freq_obs[d] * math.log2(freq_obs[d] / m)
+                if freq_exp[d] > 0 and m > 0:
+                    js += freq_exp[d] * math.log2(freq_exp[d] / m)
+            js_div = float(js / 2)
+
+            digitos_suspeitos = [d for d in digitos
+                                  if abs(freq_obs[d] - freq_exp[d]) > MARGEM_SUSPEITA]
+
+            r = BenfordResult(
                 mad=mad, chi2_stat=chi2_stat, chi2_pvalue=p_value,
                 freq_obs=freq_obs, freq_exp=freq_exp,
-                digitos_suspeitos=digitos_suspeitos, desvio=desvio,
+                digitos_suspeitos=digitos_suspeitos,
+                desvio=False,
+                js_divergence=js_div,
             )
-            log.info("    [%s] MAD=%.5f  χ²=%.2f  p=%.4f  suspeitos=%s  desvio=%s",
-                     nivel.upper(), mad, chi2_stat, p_value, digitos_suspeitos, desvio)
+            r._nivel = nivel
+            r.__post_init__()
+            resultados[nivel] = r
+
+            log.info(
+                "    [%s] MAD=%.5f  χ²=%.2f  p=%.4f  JS=%.5f  suspeitos=%s  %s",
+                nivel.upper(), mad, chi2_stat, p_value, js_div,
+                digitos_suspeitos, r.emoji,
+            )
 
         return resultados
 
 
 # ─────────────────────────────────────────────
-# NÚCLEO BENFORD (compatibilidade)
+# API PÚBLICA — compatibilidade total
 # ─────────────────────────────────────────────
-
-def _analisar_distribuicao(valores: np.ndarray, freq_exp: dict, label: str) -> BenfordResult:
-    arr   = np.asarray(valores)
-    arr   = arr[arr >= 0]
-    total = len(arr)
-
-    if total == 0:
-        return BenfordResult(0, 0, 1, {}, freq_exp, [], False)
-
-    digitos  = sorted(freq_exp.keys())
-    counts   = Counter(arr.tolist())
-    freq_obs = {d: counts.get(d, 0) / total for d in digitos}
-    mad      = float(np.mean([abs(freq_obs[d] - freq_exp[d]) for d in digitos]))
-
-    chi2_stat = sum(
-        ((freq_obs[d] - freq_exp[d]) ** 2) / freq_exp[d]
-        for d in digitos if freq_exp[d] > 0
-    ) * total
-
-    p_value           = 1 - chi2.cdf(chi2_stat, len(digitos) - 1)
-    digitos_suspeitos = [d for d in digitos if freq_obs[d] > freq_exp[d] + MARGEM_SUSPEITA]
-    desvio            = mad > MAD_THRESHOLDS.get(label, 0.015) or p_value < ALPHA
-
-    return BenfordResult(mad=mad, chi2_stat=chi2_stat, chi2_pvalue=p_value,
-                         freq_obs=freq_obs, freq_exp=freq_exp,
-                         digitos_suspeitos=digitos_suspeitos, desvio=desvio)
-
 
 def analisar_benford_completo(
     valores: list | np.ndarray,
@@ -267,6 +351,15 @@ def benford_desvio_global(resultados: dict[str, BenfordResult]) -> bool:
     return any(r.desvio for r in resultados.values())
 
 
+def flag_benford_transacao(valor: float, resultados: dict[str, BenfordResult]) -> int:
+    """Compatibilidade com testes unitários."""
+    s = str(int(abs(valor)))
+    mapa = {"d1": int(s[0]), "d2": int(s[1]) if len(s) >= 2 else -1,
+            "d12": int(s[:2]) if len(s) >= 2 else -1, "last": int(s[-1])}
+    return sum(1 for nv, d in mapa.items()
+               if d >= 0 and d in resultados[nv].digitos_suspeitos)
+
+
 # ─────────────────────────────────────────────
 # FLAGS BENFORD — VETORIZADA
 # ─────────────────────────────────────────────
@@ -284,13 +377,404 @@ def calcular_flags_benford_vetorizado(
     return flags
 
 
-def flag_benford_transacao(valor: float, resultados: dict[str, BenfordResult]) -> int:
-    """Compatibilidade com testes unitários."""
-    s = str(int(abs(valor)))
-    mapa = {"d1": int(s[0]), "d2": int(s[1]) if len(s) >= 2 else -1,
-            "d12": int(s[:2]) if len(s) >= 2 else -1, "last": int(s[-1])}
-    return sum(1 for nv, d in mapa.items()
-               if d >= 0 and d in resultados[nv].digitos_suspeitos)
+# ─────────────────────────────────────────────
+# PATCH M4 — SCORE COMPOSTO + LATIN HYPERCUBE SAMPLING
+# ─────────────────────────────────────────────
+
+@dataclass
+class ComponentesScore:
+    """Os 5 componentes brutos de uma entidade, normalizados para [0, 1]."""
+    mad_medio:       float
+    chi2_pvalue_inv: float   # 1 − pvalue médio dos χ²
+    js_medio:        float
+    taxa_outliers:   float
+    taxa_cluster:    float
+
+    @property
+    def vetor(self) -> np.ndarray:
+        return np.array([
+            self.mad_medio, self.chi2_pvalue_inv,
+            self.js_medio, self.taxa_outliers, self.taxa_cluster,
+        ])
+
+
+@dataclass
+class SensitivityResult:
+    """Resultado da análise de sensibilidade LHS."""
+    ranking_medio:     list
+    estabilidade_top3: dict
+    pesos_medios:      dict
+    pesos_std:         dict
+    n_amostras:        int
+
+    def resumo(self) -> str:
+        linhas = [f"Sensibilidade LHS — {self.n_amostras} cenários", "Estabilidade top-3:"]
+        for ent, est in sorted(self.estabilidade_top3.items(), key=lambda x: -x[1]):
+            bar = "█" * int(est * 20)
+            linhas.append(f"  {str(ent)[:40]:40s} {est*100:5.1f}%  {bar}")
+        return "\n".join(linhas)
+
+
+def analisar_sensibilidade_lhs(
+    componentes_por_entidade: dict,
+    n_amostras: int = 500,
+    seed: int = 42,
+) -> SensitivityResult:
+    """
+    Gera n_amostras combinações de pesos via Latin Hypercube Sampling
+    com restrição Σwi = 1 e calcula a estabilidade de ranking por órgão.
+
+    Resultado publicável: top-3 estável em > 80% dos cenários.
+    """
+    try:
+        from scipy.stats.qmc import LatinHypercube
+    except ImportError:
+        raise ImportError("scipy >= 1.7 necessário. pip install scipy")
+
+    entidades = list(componentes_por_entidade.keys())
+    n_ent     = len(entidades)
+    if n_ent < 2:
+        return SensitivityResult(
+            ranking_medio=entidades,
+            estabilidade_top3={e: 1.0 for e in entidades},
+            pesos_medios={}, pesos_std={}, n_amostras=0,
+        )
+
+    X = np.array([componentes_por_entidade[e].vetor for e in entidades])  # (n_ent, 5)
+
+    sampler      = LatinHypercube(d=5, seed=seed)
+    raw_samples  = sampler.random(n=n_amostras)                           # (n_amostras, 5)
+    pesos_matrix = raw_samples / raw_samples.sum(axis=1, keepdims=True)   # normaliza Σ=1
+
+    scores_matrix  = pesos_matrix @ X.T                                   # (n_amostras, n_ent)
+    posicao_matrix = np.argsort(np.argsort(-scores_matrix, axis=1), axis=1)
+
+    top3_counts  = (posicao_matrix < 3).sum(axis=0)
+    estabilidade = {e: float(top3_counts[i] / n_amostras) for i, e in enumerate(entidades)}
+
+    pesos_medios_arr = pesos_matrix.mean(axis=0)
+    scores_medios    = X @ pesos_medios_arr
+    ranking_medio    = [entidades[i] for i in np.argsort(-scores_medios)]
+
+    nomes = ["w_mad", "w_chi2", "w_js", "w_outlier", "w_cluster"]
+    pm    = {n: float(pesos_medios_arr[i]) for i, n in enumerate(nomes)}
+    ps    = {n: float(pesos_matrix.std(axis=0)[i]) for i, n in enumerate(nomes)}
+
+    return SensitivityResult(
+        ranking_medio=ranking_medio, estabilidade_top3=estabilidade,
+        pesos_medios=pm, pesos_std=ps, n_amostras=n_amostras,
+    )
+
+
+# ─────────────────────────────────────────────
+# PATCH — ELIGIBILITY FILTER
+# ─────────────────────────────────────────────
+
+@dataclass
+class EligibilityResult:
+    """
+    Triagem de elegibilidade de uma partição para análise de Benford.
+
+    decisao: 'elegível' | 'elegível_com_ressalva' | 'inelegível'
+    """
+    decisao:               str
+    n_total:               int
+    n_validos:             int
+    ordens_magnitude:      int
+    pct_nulos_zerados:     float
+    truncamento_detectado: bool
+    motivo_inelegivel:     Optional[str] = None
+
+    @property
+    def elegivel(self) -> bool:
+        return self.decisao != "inelegível"
+
+
+def verificar_elegibilidade(
+    valores: np.ndarray,
+    min_registros: int = 1_000,
+    min_ordens: int = 3,
+    max_pct_nulos: float = 0.50,
+    limiar_truncamento: float = 0.30,
+) -> EligibilityResult:
+    """
+    Verifica se uma série de valores é elegível para análise de Benford.
+    Salvo no _eligibility.json da partição para não repetir a cada execução.
+    """
+    n_total   = len(valores)
+    positivos = valores[np.isfinite(valores) & (valores > 0)]
+    n_validos = len(positivos)
+    pct_nulos = (n_total - n_validos) / max(n_total, 1)
+
+    n_ordens = 0
+    if n_validos > 0:
+        ordens   = np.floor(np.log10(positivos)).astype(int)
+        n_ordens = int(np.unique(ordens).size)
+
+    truncamento = False
+    if n_validos > 0:
+        inteiros    = positivos.astype(np.int64)
+        truncamento = bool(np.isin(inteiros % 10, [0, 5]).mean() > limiar_truncamento)
+
+    motivo = None
+    if n_validos < min_registros:
+        decisao = "inelegível"
+        motivo  = f"n_validos={n_validos} < min={min_registros}"
+    elif n_ordens < min_ordens:
+        decisao = "inelegível"
+        motivo  = f"ordens_magnitude={n_ordens} < min={min_ordens}"
+    elif pct_nulos > max_pct_nulos:
+        decisao = "inelegível"
+        motivo  = f"pct_nulos={pct_nulos:.1%} > max={max_pct_nulos:.1%}"
+    elif truncamento or pct_nulos > 0.20:
+        decisao = "elegível_com_ressalva"
+    else:
+        decisao = "elegível"
+
+    return EligibilityResult(
+        decisao=decisao, n_total=n_total, n_validos=n_validos,
+        ordens_magnitude=n_ordens, pct_nulos_zerados=round(pct_nulos, 4),
+        truncamento_detectado=truncamento, motivo_inelegivel=motivo,
+    )
+
+
+# ─────────────────────────────────────────────
+# PATCH — THRESHOLD / BUNCHING (Lei 14.133/2021)
+# ─────────────────────────────────────────────
+
+@dataclass
+class LimiarLegal:
+    valor:      float
+    descricao:  str
+    modalidade: str
+    lei:        str
+
+LIMIARES_LEGAIS: dict[str, LimiarLegal] = {
+    "dispensa_eletro_bens": LimiarLegal(
+        50_000, "Dispensa eletrônica — bens e serviços",
+        "Dispensa", "Lei 14.133/2021, art. 75, I",
+    ),
+    "dispensa_eletro_obras": LimiarLegal(
+        100_000, "Dispensa eletrônica — obras",
+        "Dispensa", "Lei 14.133/2021, art. 75, §1º",
+    ),
+    "pregao_eletronico": LimiarLegal(
+        1_500_000, "Pregão eletrônico",
+        "Pregão", "Lei 14.133/2021, art. 6º, XLI",
+    ),
+}
+
+
+@dataclass
+class BunchingResult:
+    entidade:      str
+    chave_limiar:  str
+    limiar:        LimiarLegal
+    n_observacoes: int
+    iab:           float   # Índice de Acumulação Abaixo
+    pvalue:        float
+    suspeito:      bool
+
+    @property
+    def nivel_suspeicao(self) -> str:
+        if self.iab > 3.0 and self.pvalue < 0.05: return "alto"
+        if self.iab > 2.0 and self.pvalue < 0.10: return "moderado"
+        return "normal"
+
+
+def _integrar_kde(kde, a: float, b: float, n: int = 200) -> float:
+    pts  = np.linspace(a, b, n)
+    vals = kde(pts)
+    return float(np.trapezoid(vals, pts) if hasattr(np, "trapezoid") else np.trapz(vals, pts))
+
+
+def analisar_bunching(
+    valores: np.ndarray,
+    entidade: str = "global",
+    largura: float = 0.15,
+    n_bootstrap: int = 300,
+    min_obs: int = 30,
+    seed: int = 42,
+) -> list[BunchingResult]:
+    """
+    Detecta acumulação de valores logo abaixo de limiares legais via KDE + IAB.
+    IAB > 2.0 e p < 0.05 → suspeito.
+    """
+    from scipy.stats import gaussian_kde
+
+    X   = np.asarray(valores, dtype=np.float64)
+    X   = X[np.isfinite(X) & (X > 0)]
+    rng = np.random.default_rng(seed)
+    resultados = []
+
+    for chave, lim in LIMIARES_LEGAIS.items():
+        lo_ab  = lim.valor * (1 - largura)
+        hi_ac  = lim.valor * (1 + largura)
+        janela = X[(X >= lo_ab) & (X <= hi_ac)]
+        if len(janela) < min_obs:
+            continue
+        try:
+            kde = gaussian_kde(janela, bw_method="scott")
+        except Exception:
+            continue
+
+        d_ab = _integrar_kde(kde, lo_ab, lim.valor)
+        d_ac = _integrar_kde(kde, lim.valor, hi_ac)
+        iab  = d_ab / (d_ac + 1e-12)
+
+        count_ext = 0
+        for _ in range(n_bootstrap):
+            perm = rng.permutation(janela)
+            try:
+                kde_p = gaussian_kde(perm, bw_method="scott")
+            except Exception:
+                continue
+            iab_p = _integrar_kde(kde_p, lo_ab, lim.valor) / (
+                _integrar_kde(kde_p, lim.valor, hi_ac) + 1e-12
+            )
+            if iab_p >= iab:
+                count_ext += 1
+        pvalue = count_ext / n_bootstrap
+
+        resultados.append(BunchingResult(
+            entidade=entidade, chave_limiar=chave, limiar=lim,
+            n_observacoes=len(janela), iab=iab, pvalue=pvalue,
+            suspeito=(iab > 2.0 and pvalue < 0.05),
+        ))
+
+    return resultados
+
+
+def analisar_bunching_por_orgao(
+    df: pd.DataFrame,
+    col_valor: str = "valor",
+    col_orgao: str = "orgao",
+    col_uf: Optional[str] = "uf",
+    min_obs: int = 30,
+    n_bootstrap: int = 200,
+    seed: int = 42,
+) -> pd.DataFrame:
+    """Roda análise de bunching para cada combinação órgão × UF."""
+    agrupar = [c for c in [col_orgao, col_uf] if c and c in df.columns]
+    if not agrupar:
+        return pd.DataFrame()
+
+    linhas = []
+    for chave_grp, grp in df.groupby(agrupar):
+        orgao_uf = chave_grp if isinstance(chave_grp, tuple) else (chave_grp,)
+        entidade = " | ".join(str(x) for x in orgao_uf)
+        vals     = grp[col_valor].dropna().values
+        vals     = vals[vals > 0]
+
+        for r in analisar_bunching(vals, entidade, min_obs=min_obs,
+                                   n_bootstrap=n_bootstrap, seed=seed):
+            row = dict(zip(agrupar, orgao_uf))
+            row.update({
+                "chave_limiar":    r.chave_limiar,
+                "limiar_valor":    r.limiar.valor,
+                "iab":             round(r.iab, 4),
+                "pvalue":          round(r.pvalue, 4),
+                "suspeito":        r.suspeito,
+                "n_obs":           r.n_observacoes,
+                "nivel_suspeicao": r.nivel_suspeicao,
+            })
+            linhas.append(row)
+
+    if not linhas:
+        return pd.DataFrame()
+    return pd.DataFrame(linhas).sort_values(["suspeito", "iab"], ascending=[False, False])
+
+
+# ─────────────────────────────────────────────
+# PATCH M7 — REDES DE BENEFICIÁRIOS
+# ─────────────────────────────────────────────
+
+def construir_grafo_contratacoes(
+    df: pd.DataFrame,
+    col_orgao: str = "orgao",
+    col_fornecedor: str = "cpf_cnpj",
+    col_valor: str = "valor",
+):
+    """Constrói grafo bipartido órgão ↔ fornecedor. Requer: pip install networkx"""
+    try:
+        import networkx as nx
+    except ImportError:
+        raise ImportError("networkx necessário. pip install networkx")
+
+    G = nx.Graph()
+    for _, row in df.iterrows():
+        orgao = f"O_{row[col_orgao]}"
+        forn  = f"F_{row[col_fornecedor]}"
+        valor = float(row[col_valor]) if pd.notna(row[col_valor]) else 0.0
+
+        if orgao not in G:
+            G.add_node(orgao, type="orgao", volume_total=0.0)
+        G.nodes[orgao]["volume_total"] += valor
+
+        if forn not in G:
+            G.add_node(forn, type="fornecedor")
+
+        if G.has_edge(orgao, forn):
+            G[orgao][forn]["peso"]        += valor
+            G[orgao][forn]["n_contratos"] += 1
+        else:
+            G.add_edge(orgao, forn, peso=valor, n_contratos=1)
+
+    return G
+
+
+def detectar_empresa_prateleira(
+    df: pd.DataFrame,
+    col_orgao: str = "orgao",
+    col_fornecedor: str = "cpf_cnpj",
+    col_valor: str = "valor",
+    col_constituicao: Optional[str] = None,
+    limiar_concentracao: float = 0.80,
+    janela_meses: int = 12,
+) -> pd.DataFrame:
+    """
+    Identifica fornecedores com alta concentração em único órgão
+    e/ou constituídos recentemente (empresa de prateleira).
+    """
+    resumo = []
+    for forn, grp in df.groupby(col_fornecedor):
+        total = grp[col_valor].sum()
+        if total <= 0:
+            continue
+        por_orgao    = grp.groupby(col_orgao)[col_valor].sum()
+        orgao_princ  = por_orgao.idxmax()
+        concentracao = por_orgao.max() / total
+
+        delta_dias = None
+        if col_constituicao and col_constituicao in df.columns:
+            const = grp[col_constituicao].dropna()
+            if not const.empty:
+                data_const  = pd.to_datetime(const.iloc[0])
+                primeiro_ct = pd.to_datetime(grp.index.min()) if hasattr(grp.index, "min") else None
+                if primeiro_ct is not None:
+                    delta_dias = (primeiro_ct - data_const).days
+
+        prateleira_tempo = delta_dias is not None and 0 <= delta_dias <= janela_meses * 30
+        prateleira_conc  = concentracao >= limiar_concentracao
+        score = int(prateleira_tempo) + int(prateleira_conc)
+
+        if score >= 1:
+            resumo.append({
+                "cpf_cnpj":             forn,
+                "orgao_principal":      orgao_princ,
+                "concentracao":         round(concentracao, 4),
+                "volume_total":         total,
+                "prateleira_por_tempo": prateleira_tempo,
+                "prateleira_por_conc":  prateleira_conc,
+                "score_prateleira":     score,
+                "nivel":                "alto" if score == 2 else "moderado",
+            })
+
+    if not resumo:
+        return pd.DataFrame()
+    return pd.DataFrame(resumo).sort_values(
+        ["score_prateleira", "volume_total"], ascending=[False, False]
+    )
 
 
 # ─────────────────────────────────────────────
@@ -455,7 +939,6 @@ def processar_chunk(
     outlier_iqr, outlier_z, outlier_mad = detectar_outliers(X)
     flags_benford = calcular_flags_benford_vetorizado(digitos, benford_global)
 
-    # Clusters dentro do chunk
     cluster_risco = np.zeros(len(chunk), dtype=bool)
     if colunas_cluster and all(c in chunk.columns for c in colunas_cluster):
         outlier_any     = outlier_iqr | outlier_z | outlier_mad
@@ -481,7 +964,6 @@ def processar_chunk(
     chunk["score_norm"]         = norm_score
     chunk["classificacao"]      = _classificar_array(norm_score)
 
-    # Libera arrays temporários antes de retornar
     del X, digitos, outlier_iqr, outlier_z, outlier_mad
     del flags_benford, cluster_risco, raw, norm_score
 
@@ -493,11 +975,16 @@ def processar_chunk(
 # ─────────────────────────────────────────────
 
 def detectar_fraude_chunked(
-    chunks_fn,                          # callable() → Iterator[pd.DataFrame]
+    chunks_fn,
     output_csv: str,
     colunas_cluster: list[str],
     coluna_valor: str = "valor",
     chunk_size: int = CHUNK_SIZE,
+    # ── PATCH M4 / Bunching / M7: novos parâmetros opcionais ─────────────────
+    incluir_sensibilidade: bool = True,
+    incluir_bunching: bool = False,
+    col_uf: Optional[str] = None,
+    col_orgao: str = "orgao",
 ) -> dict:
     """
     Pipeline completo em duas passagens para datasets que não cabem na RAM.
@@ -507,27 +994,28 @@ def detectar_fraude_chunked(
     Passagem 2 — processa cada chunk com o Benford global, escreve CSV
                  incrementalmente e libera a RAM antes do próximo.
 
-    Parâmetros
-    ----------
-    chunks_fn       : callable sem argumentos que retorna Iterator[pd.DataFrame]
-    output_csv      : caminho do CSV de saída (será sobrescrito)
-    colunas_cluster : colunas para agrupamento
-    coluna_valor    : nome da coluna monetária
-    chunk_size      : hint de tamanho do chunk (usado pelo chamador)
-
-    Retorna
-    -------
-    metricas : dict com benford_global, normalidade (amostral), benford_desvio
+    Novos parâmetros
+    ----------------
+    incluir_sensibilidade : roda análise LHS (500 cenários) ao final
+    incluir_bunching      : roda análise de bunching por órgão (requer col_uf)
+    col_uf                : nome da coluna de UF (para bunching)
+    col_orgao             : nome da coluna de órgão
     """
     t_total = time.perf_counter()
 
-    # ── 1ª passagem — acumula Benford e estatísticas globais ──────────
+    # ── 1ª passagem ──────────────────────────────────────────────────
     log.info("Passagem 1/2 — acumulando estatísticas globais...")
     acum        = BenfordAccumulator()
-    sample_vals = []   # amostra para normalidade (máx 5000 valores)
+    sample_vals = []
     n_total     = 0
     raw_min     = np.inf
     raw_max     = -np.inf
+
+    # Acumula componentes por órgão para LHS (M4)
+    orgao_mad:     dict[str, list] = {}
+    orgao_chi2inv: dict[str, list] = {}
+    orgao_js:      dict[str, list] = {}
+    orgao_outlier: dict[str, list] = {}
 
     for chunk in tqdm(chunks_fn(), desc="Passagem 1", unit="chunk"):
         vals = chunk[coluna_valor].dropna()
@@ -537,34 +1025,67 @@ def detectar_fraude_chunked(
         acum.alimentar(vals)
         n_total += len(vals)
 
-        # Amostra para normalidade
         if len(sample_vals) < 5000:
             sample_vals.extend(vals[:max(0, 5000 - len(sample_vals))].tolist())
 
-        # Pré-calcula range do score raw para normalização global consistente
         oir, oz, om = detectar_outliers(vals)
-        raw_chunk = (WEIGHTS["w1"] * oir.astype(float)
-                   + WEIGHTS["w2"] * oz.astype(float)
-                   + WEIGHTS["w3"] * om.astype(float))
+        raw_chunk   = (WEIGHTS["w1"] * oir.astype(float)
+                     + WEIGHTS["w2"] * oz.astype(float)
+                     + WEIGHTS["w3"] * om.astype(float))
         raw_min = min(raw_min, raw_chunk.min())
         raw_max = max(raw_max, raw_chunk.max())
+
+        # Acumula componentes por órgão para LHS
+        if col_orgao in chunk.columns and incluir_sensibilidade:
+            digitos_chunk = _extrair_digitos_vetorizado(vals)
+            bf_chunk      = analisar_benford_completo(vals, digitos_vetorizados=digitos_chunk)
+            outlier_any   = oir | oz | om
+            chunk_reset   = chunk.reset_index(drop=True)
+            for orgao, grp in chunk_reset.groupby(col_orgao):
+                k = str(orgao)
+                orgao_mad.setdefault(k, []).append(
+                    float(np.mean([bf_chunk[n].mad for n in bf_chunk]))
+                )
+                orgao_chi2inv.setdefault(k, []).append(
+                    float(np.mean([1 - bf_chunk[n].chi2_pvalue for n in bf_chunk]))
+                )
+                orgao_js.setdefault(k, []).append(
+                    float(np.mean([bf_chunk[n].js_divergence for n in bf_chunk]))
+                )
+                local_idx = grp.index.to_numpy()
+                if len(local_idx):
+                    orgao_outlier.setdefault(k, []).append(
+                        float(outlier_any[local_idx].mean())
+                    )
+
         del vals, oir, oz, om, raw_chunk
 
     with _cronometrar("Finalizando Benford global"):
         benford_global = acum.finalizar()
     del acum
 
-    norm_result = testar_normalidade(np.array(sample_vals))
-    del sample_vals
+    # Eligibility check global
+    sample_arr = np.array(sample_vals)
+    elig       = verificar_elegibilidade(sample_arr)
+    if not elig.elegivel:
+        log.warning("⚠️  Eligibilidade: %s — %s", elig.decisao, elig.motivo_inelegivel)
+    else:
+        log.info("✅ Eligibilidade: %s (n=%d, ordens=%d)",
+                 elig.decisao, elig.n_validos, elig.ordens_magnitude)
 
-    log.info("  Total acumulado: %d registros  raw_score ∈ [%.4f, %.4f]",
-             n_total, raw_min, raw_max)
+    norm_result = testar_normalidade(sample_arr)
+    del sample_vals, sample_arr
 
-    # ── 2ª passagem — processa e salva chunk a chunk ──────────────────
+    log.info("  Total: %d registros  raw_score ∈ [%.4f, %.4f]", n_total, raw_min, raw_max)
+
+    # ── 2ª passagem ──────────────────────────────────────────────────
     log.info("Passagem 2/2 — processando e gravando resultados...")
-    primeiro = True
+    primeiro   = True
     n_gravados = 0
     contadores: Counter = Counter()
+
+    df_amostra_bunching: list[pd.DataFrame] = []
+    MAX_AMOSTRA_BUNCHING = 100_000
 
     for chunk in tqdm(chunks_fn(), desc="Passagem 2", unit="chunk"):
         resultado = processar_chunk(
@@ -580,18 +1101,62 @@ def detectar_fraude_chunked(
                          header=primeiro, index=False)
         n_gravados += len(resultado)
         primeiro    = False
-        del chunk, resultado   # libera RAM antes do próximo chunk
+
+        if incluir_bunching and n_gravados <= MAX_AMOSTRA_BUNCHING:
+            cols_bch = [c for c in [coluna_valor, col_orgao, col_uf]
+                        if c and c in resultado.columns]
+            df_amostra_bunching.append(resultado[cols_bch].copy())
+
+        del chunk, resultado
 
     metricas = dict(
         normalidade    = norm_result,
         benford_global = benford_global,
         benford_desvio = benford_desvio_global(benford_global),
+        eligibility    = elig,
         n_total        = n_total,
         classificacao  = dict(contadores),
     )
 
+    # ── Score composto + LHS (M4) ─────────────────────────────────────
+    if incluir_sensibilidade and orgao_mad:
+        log.info("Calculando Score Composto + Análise de Sensibilidade LHS...")
+        comp_por_orgao = {
+            orgao: ComponentesScore(
+                mad_medio       = float(np.mean(orgao_mad[orgao])),
+                chi2_pvalue_inv = float(np.mean(orgao_chi2inv.get(orgao, [0.5]))),
+                js_medio        = float(np.mean(orgao_js.get(orgao, [0.0]))),
+                taxa_outliers   = float(np.mean(orgao_outlier.get(orgao, [0.0]))),
+                taxa_cluster    = 0.0,
+            )
+            for orgao in orgao_mad
+        }
+        try:
+            sens = analisar_sensibilidade_lhs(comp_por_orgao)
+            metricas["sensibilidade"]  = sens
+            metricas["ranking_orgaos"] = sens.ranking_medio
+            log.info("Sensibilidade: %d órgãos, %d cenários", len(comp_por_orgao), sens.n_amostras)
+        except Exception as e:
+            log.warning("Sensibilidade LHS falhou: %s", e)
+
+    # ── Bunching ──────────────────────────────────────────────────────
+    if incluir_bunching and df_amostra_bunching:
+        log.info("Análise de bunching / limiares legais...")
+        df_bch = pd.concat(df_amostra_bunching, ignore_index=True)
+        del df_amostra_bunching
+        try:
+            metricas["bunching"] = analisar_bunching_por_orgao(
+                df_bch, col_valor=coluna_valor,
+                col_orgao=col_orgao, col_uf=col_uf,
+                min_obs=20, n_bootstrap=200,
+            )
+        except Exception as e:
+            log.warning("Bunching falhou: %s", e)
+        del df_bch
+
     elapsed = time.perf_counter() - t_total
-    log.info("Pipeline chunked completo — %d registros em %.1fs", n_gravados, elapsed)
+    metricas["elapsed_s"] = elapsed
+    log.info("Pipeline completo — %d registros em %.1fs", n_gravados, elapsed)
     for cls, n in contadores.items():
         log.info("  %-14s %8d (%.1f%%)", cls, n, n / max(n_gravados, 1) * 100)
 
@@ -656,7 +1221,7 @@ def detectar_fraude(
 
     step("clusters")
     with _cronometrar("Clusters"):
-        cluster_risco = np.zeros(len(df), dtype=bool)
+        cluster_risco   = np.zeros(len(df), dtype=bool)
         cluster_results = {}
         if colunas_cluster and all(c in df.columns for c in colunas_cluster):
             outlier_any     = outlier_iqr | outlier_z | outlier_mad_arr
@@ -704,21 +1269,50 @@ def detectar_fraude(
 # RELATÓRIO
 # ─────────────────────────────────────────────
 
-def imprimir_relatorio(df_result: pd.DataFrame, metricas: dict) -> None:
+def imprimir_relatorio(df_result: Optional[pd.DataFrame], metricas: dict) -> None:
     sep = "=" * 65
     print(f"\n{sep}\n  RELATÓRIO DE DETECÇÃO DE FRAUDE\n{sep}")
+
+    # ── PATCH: bloco de eligibilidade ────────────────────────────────
+    elig = metricas.get("eligibility")
+    if elig:
+        print(f"\n🔍 ELIGIBILIDADE BENFORD")
+        print(f"   Decisão: {elig.decisao.upper()}")
+        print(f"   n válidos: {elig.n_validos:,}  |  ordens: {elig.ordens_magnitude}"
+              f"  |  nulos/zeros: {elig.pct_nulos_zerados:.1%}")
+        if elig.truncamento_detectado:
+            print("   ⚠️  Truncamento artificial detectado")
+        if elig.motivo_inelegivel:
+            print(f"   Motivo: {elig.motivo_inelegivel}")
 
     n = metricas["normalidade"]
     print(f"\n📊 NORMALIDADE")
     print(f"   Shapiro p={n['p_shapiro']:.4f} | KS p={n['p_ks']:.4f} | "
           f"Normal={'✅' if n['normal'] else '❌'}")
 
+    # ── PATCH M2: exibe JS + flag tri-estado no relatório ─────────────
     print(f"\n🔢 BENFORD MULTI-DÍGITO (Global)")
     for nivel, res in metricas["benford_global"].items():
-        status = "🚨" if res.desvio else "✅"
+        js_str = f"JS={res.js_divergence:.5f}  " if res.js_divergence else ""
         print(f"   [{nivel.upper():4s}] MAD={res.mad:.5f}  χ²={res.chi2_stat:.2f}  "
-              f"p={res.chi2_pvalue:.4f}  Suspeitos={res.digitos_suspeitos}  {status}")
+              f"p={res.chi2_pvalue:.4f}  {js_str}"
+              f"Suspeitos={res.digitos_suspeitos}  {res.emoji}")
     print(f"\n   Desvio global: {'🚨 SIM' if metricas['benford_desvio'] else '✅ NÃO'}")
+
+    # ── PATCH M4: bloco de sensibilidade LHS ─────────────────────────
+    sens = metricas.get("sensibilidade")
+    if sens:
+        print(f"\n📐 ANÁLISE DE SENSIBILIDADE LHS ({sens.n_amostras} cenários)")
+        print("   Estabilidade top-3:")
+        for ent, est in sorted(sens.estabilidade_top3.items(), key=lambda x: -x[1])[:10]:
+            bar = "█" * int(est * 20)
+            print(f"   {str(ent)[:35]:35s} {est*100:5.1f}%  {bar}")
+
+    ranking = metricas.get("ranking_orgaos")
+    if ranking:
+        print(f"\n🏆 RANKING DE ÓRGÃOS (mais suspeitos primeiro):")
+        for i, orgao in enumerate(ranking[:10], 1):
+            print(f"   {i:2d}. {orgao}")
 
     if df_result is not None:
         print(f"\n⚠️  OUTLIERS")
@@ -756,47 +1350,25 @@ def imprimir_relatorio(df_result: pd.DataFrame, metricas: dict) -> None:
                     else (f"R$ {v/1e3:.1f} k" if v >= 1e3 else f"R$ {v:.2f}"))
             print(display.to_string(index=False))
 
-    # Relatório resumido para modo chunked (sem df_result)
     if "classificacao" in metricas:
         print(f"\n🎯 CLASSIFICAÇÃO FINAL (chunked)")
         total = sum(metricas["classificacao"].values())
         for cls, n in metricas["classificacao"].items():
             print(f"   {cls:14s}: {n:7,} ({n/max(total,1)*100:.1f}%)")
 
+    # ── PATCH Bunching: bloco de bunching ─────────────────────────────
+    bch = metricas.get("bunching")
+    if bch is not None and not (hasattr(bch, "empty") and bch.empty):
+        n_susp = bch["suspeito"].sum() if hasattr(bch, "columns") else 0
+        print(f"\n⚖️  BUNCHING — {n_susp} combinações suspeitas abaixo de limiares legais")
+        if n_susp > 0:
+            cols_show = [c for c in ["orgao", "uf", "chave_limiar", "limiar_valor",
+                                      "iab", "pvalue", "n_obs", "nivel_suspeicao"]
+                         if c in bch.columns]
+            print(bch[bch["suspeito"] == True][cols_show].head(10).to_string(index=False))
+
+    elapsed = metricas.get("elapsed_s")
+    if elapsed:
+        print(f"\n⏱️  Tempo total: {elapsed:.1f}s")
+
     print(f"\n{sep}\n")
-
-
-# ─────────────────────────────────────────────
-# GERAÇÃO DE DADOS SIMULADOS
-# ─────────────────────────────────────────────
-
-def gerar_dataset_simulado(
-    qtd: int = 2000, percentual_fraude: float = 0.15,
-    digito_forcado: int = 9, seed: int = 42,
-) -> pd.DataFrame:
-    rng    = np.random.default_rng(seed)
-    valores = rng.lognormal(mean=8, sigma=1.2, size=qtd).tolist()
-    for i in rng.choice(qtd, int(qtd * percentual_fraude), replace=False):
-        s = str(int(valores[i]))
-        valores[i] = float(str(digito_forcado) + s[1:]) if len(s) > 1 else float(digito_forcado)
-    return pd.DataFrame(dict(
-        valor  = valores,
-        orgao  = rng.choice(["MEC","MS","MDR","MF"], size=qtd),
-        ano    = rng.choice([2021,2022,2023,2024], size=qtd),
-        funcao = rng.choice(["Educação","Saúde","Infraestrutura","Defesa"], size=qtd),
-    ))
-
-
-# ─────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s  %(levelname)-8s  %(message)s",
-                        datefmt="%H:%M:%S")
-
-    df = gerar_dataset_simulado(qtd=3000, percentual_fraude=0.18, digito_forcado=9)
-    df_result, metricas = detectar_fraude(df, colunas_cluster=["orgao","ano","funcao"])
-    imprimir_relatorio(df_result, metricas)
-    df_result.to_csv("resultado_fraude.csv", index=False)

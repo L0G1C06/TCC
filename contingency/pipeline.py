@@ -5,9 +5,12 @@ Pré-requisito: rodar ingest.py ao menos uma vez.
 
 Uso:
     python3 pipeline.py
-    python3 pipeline.py --fonte CPGF VIAGENS   # filtra fontes
-    python3 pipeline.py --ano 2022 2023         # filtra anos
-    python3 pipeline.py --chunk-size 300000     # ajusta RAM por chunk (padrão 500k)
+    python3 pipeline.py --fonte CPGF VIAGENS       # filtra fontes
+    python3 pipeline.py --ano 2022 2023             # filtra anos
+    python3 pipeline.py --chunk-size 300000         # ajusta RAM por chunk (padrão 500k)
+    python3 pipeline.py --bunching                  # ativa análise de limiares legais
+    python3 pipeline.py --sem-sensibilidade         # desativa LHS (mais rápido)
+    python3 pipeline.py --grafos                    # ativa análise de redes
 """
 
 from __future__ import annotations
@@ -33,10 +36,13 @@ os.chdir(PROJECT_ROOT)
 load_dotenv(PROJECT_ROOT / "dev.env")
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "contingency.settings")
 
+# ── PATCH: importa os novos símbolos do benfordLaw ────────────────────────────
 from mathCore.benfordLaw import (
     CHUNK_SIZE,
     detectar_fraude_chunked,
     imprimir_relatorio,
+    construir_grafo_contratacoes,
+    detectar_empresa_prateleira,
 )
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -55,6 +61,8 @@ OUTPUT_CSV = PROJECT_ROOT / "resultado_fraude_consolidado.csv"
 
 COLUNA_VALOR    = "valor"
 COLUNA_FONTE    = "fonte"
+COLUNA_ORGAO    = "orgao"
+COLUNA_UF       = "uf"
 COLUNAS_CLUSTER = ["orgao", "ano", "funcao"]
 
 # CEIS não tem valor monetário real — excluída da análise de Benford
@@ -69,10 +77,16 @@ def _parse_args() -> argparse.Namespace:
                         help="Filtrar por fonte (ex: CPGF VIAGENS).")
     parser.add_argument("--ano", nargs="+", type=int, metavar="ANO",
                         help="Filtrar por ano (ex: 2022 2023).")
-    parser.add_argument("--chunk-size", type=int, default=CHUNK_SIZE,
-                        dest="chunk_size",
+    parser.add_argument("--chunk-size", type=int, default=CHUNK_SIZE, dest="chunk_size",
                         help=f"Registros por chunk (padrão {CHUNK_SIZE:,}). "
                              "Reduza se a RAM esgotar.")
+    # ── PATCH: novos flags ────────────────────────────────────────────────────
+    parser.add_argument("--bunching", action="store_true",
+                        help="Ativa análise de bunching/limiares legais (Lei 14.133/2021).")
+    parser.add_argument("--sem-sensibilidade", action="store_true", dest="sem_sensibilidade",
+                        help="Desativa análise de sensibilidade LHS (mais rápido).")
+    parser.add_argument("--grafos", action="store_true",
+                        help="Ativa análise de redes de beneficiários (requer networkx).")
     return parser.parse_args()
 
 
@@ -105,18 +119,21 @@ def _chunks_do_db(
     where_clause: str,
     params: list,
     chunk_size: int,
+    incluir_cpf_cnpj: bool = False,   # PATCH: parâmetro para análise de redes
 ) -> Iterator[pd.DataFrame]:
     """
     Lê o DuckDB em chunks via fetchmany — nunca carrega tudo na RAM de uma vez.
     Cada chunk é um DataFrame independente; o anterior pode ser coletado pelo GC.
     """
+    # PATCH: inclui cpf_cnpj quando a análise de redes está ativa
+    colunas_extra = ", cpf_cnpj" if incluir_cpf_cnpj else ", cpf_cnpj"
     query = f"""
-        SELECT valor, orgao, ano, funcao, fonte, favorecido, cpf_cnpj
+        SELECT valor, orgao, ano, funcao, fonte, favorecido{colunas_extra}
         FROM dados
         {where_clause}
     """
     with duckdb.connect(str(DB_PATH), read_only=True) as db:
-        rel    = db.execute(query, params)
+        rel     = db.execute(query, params)
         colunas = [desc[0] for desc in rel.description]
         while True:
             rows = rel.fetchmany(chunk_size)
@@ -127,9 +144,8 @@ def _chunks_do_db(
 
 # ── Resumo do DB ──────────────────────────────────────────────────────────────
 
-def _log_resumo_db(where_clause: str, params: list) -> None:
+def _log_resumo_db(where_clause: str, params: list) -> int:
     with duckdb.connect(str(DB_PATH), read_only=True) as db:
-        # Fontes disponíveis
         fontes = [r[0] for r in db.execute(
             "SELECT DISTINCT fonte FROM dados ORDER BY fonte"
         ).fetchall()]
@@ -137,9 +153,10 @@ def _log_resumo_db(where_clause: str, params: list) -> None:
             log.error("DB vazio. Execute: python3 ingest.py")
             sys.exit(1)
 
-        # Contagem por fonte no filtro atual
-        count_query = f"SELECT fonte, COUNT(*) FROM dados {where_clause} GROUP BY fonte ORDER BY fonte"
-        rows = db.execute(count_query, params).fetchall()
+        rows = db.execute(
+            f"SELECT fonte, COUNT(*) FROM dados {where_clause} GROUP BY fonte ORDER BY fonte",
+            params,
+        ).fetchall()
 
     log.info("Fontes no filtro atual:")
     total = 0
@@ -149,6 +166,69 @@ def _log_resumo_db(where_clause: str, params: list) -> None:
         total += n
     log.info("  %-28s %10d registros", "TOTAL", total)
     return total
+
+
+# ── PATCH M7: análise de redes (pós-pipeline) ────────────────────────────────
+
+def _rodar_analise_grafos(
+    where_clause: str,
+    params: list,
+    chunk_size: int,
+) -> None:
+    """
+    Constrói o grafo bipartido órgão ↔ fornecedor sobre uma amostra do DB
+    e imprime o relatório de empresas de prateleira.
+    Limitado a 500k registros para não saturar a RAM.
+    """
+    log.info("Carregando amostra para análise de redes (máx 500k registros)...")
+    MAX_GRAFOS = 500_000
+    dfs = []
+    n   = 0
+    for chunk in _chunks_do_db(where_clause, params, chunk_size, incluir_cpf_cnpj=True):
+        dfs.append(chunk[["orgao", "cpf_cnpj", "valor"]].dropna())
+        n += len(chunk)
+        if n >= MAX_GRAFOS:
+            break
+
+    if not dfs:
+        log.warning("Nenhum dado disponível para análise de redes.")
+        return
+
+    df_rede = pd.concat(dfs, ignore_index=True)
+    del dfs
+
+    log.info("Construindo grafo bipartido (%d registros)...", len(df_rede))
+    try:
+        import networkx as nx
+        G         = construir_grafo_contratacoes(df_rede)
+        n_orgaos  = sum(1 for _, d in G.nodes(data=True) if d.get("type") == "orgao")
+        n_fornec  = sum(1 for _, d in G.nodes(data=True) if d.get("type") == "fornecedor")
+        vol_total = sum(d["peso"] for _, _, d in G.edges(data=True))
+        log.info(
+            "Grafo: %d órgãos  %d fornecedores  %d contratos  R$ %.2fM total",
+            n_orgaos, n_fornec, G.number_of_edges(), vol_total / 1e6,
+        )
+
+        prateleira = detectar_empresa_prateleira(df_rede)
+        if prateleira.empty:
+            log.info("Nenhuma empresa de prateleira detectada.")
+        else:
+            n_alto = (prateleira["nivel"] == "alto").sum()
+            n_mod  = (prateleira["nivel"] == "moderado").sum()
+            log.info("Empresas de prateleira — alto risco: %d  moderado: %d", n_alto, n_mod)
+            print("\n🕸️  EMPRESAS DE PRATELEIRA (top 20)")
+            print(prateleira.head(20).to_string(index=False))
+
+        grafo_path = PROJECT_ROOT / "grafo_contratacoes.graphml"
+        nx.write_graphml(G, str(grafo_path))
+        log.info("Grafo exportado: %s", grafo_path)
+
+    except ImportError:
+        log.warning("networkx não instalado. pip install networkx")
+    except Exception as e:
+        log.error("Análise de grafos falhou: %s", e)
+
+    del df_rede
 
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────
@@ -165,7 +245,19 @@ def main() -> None:
 
     log.info("DB: %s", DB_PATH)
     log.info("Chunk size: %d registros (~%.0f MB por chunk estimado)",
-             args.chunk_size, args.chunk_size * 7 * 8 / 1e6)  # 7 colunas float64
+             args.chunk_size, args.chunk_size * 7 * 8 / 1e6)
+
+    # ── PATCH: lê e loga os flags ativos ─────────────────────────────────────
+    incluir_sensibilidade = not args.sem_sensibilidade
+    incluir_bunching      = args.bunching
+    incluir_grafos        = args.grafos
+
+    if incluir_sensibilidade:
+        log.info("✅ Análise de sensibilidade LHS ativada (500 cenários)")
+    if incluir_bunching:
+        log.info("✅ Análise de bunching ativada (limiares Lei 14.133/2021)")
+    if incluir_grafos:
+        log.info("✅ Análise de redes ativada")
 
     total = _log_resumo_db(where_clause, params)
     if total == 0:
@@ -174,20 +266,28 @@ def main() -> None:
 
     log.info("Iniciando pipeline chunked — saída: %s", OUTPUT_CSV)
 
-    # chunks_fn é um callable que reinicia o gerador (necessário para 2 passagens)
     def chunks_fn() -> Iterator[pd.DataFrame]:
         return _chunks_do_db(where_clause, params, args.chunk_size)
 
+    # ── PATCH: passa novos parâmetros para detectar_fraude_chunked ────────────
     metricas = detectar_fraude_chunked(
-        chunks_fn       = chunks_fn,
-        output_csv      = str(OUTPUT_CSV),
-        colunas_cluster = COLUNAS_CLUSTER,
-        coluna_valor    = COLUNA_VALOR,
-        chunk_size      = args.chunk_size,
+        chunks_fn             = chunks_fn,
+        output_csv            = str(OUTPUT_CSV),
+        colunas_cluster       = COLUNAS_CLUSTER,
+        coluna_valor          = COLUNA_VALOR,
+        chunk_size            = args.chunk_size,
+        incluir_sensibilidade = incluir_sensibilidade,
+        incluir_bunching      = incluir_bunching,
+        col_uf                = COLUNA_UF,
+        col_orgao             = COLUNA_ORGAO,
     )
 
     imprimir_relatorio(df_result=None, metricas=metricas)
     log.info("Resultado salvo em: %s", OUTPUT_CSV)
+
+    # ── PATCH M7: análise de redes roda após o pipeline principal ────────────
+    if incluir_grafos:
+        _rodar_analise_grafos(where_clause, params, args.chunk_size)
 
 
 if __name__ == "__main__":
