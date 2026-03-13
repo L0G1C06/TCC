@@ -34,7 +34,11 @@ class BaseImportCommand(BaseCommand):
 
     def _read_data(self, ano, mes, limit):
         """Leitura padrão — sobrescrever em datasets sem partição de mês."""
-        return self.duckdb_model.polars(ano=ano, mes=mes).limit(limit).collect()
+        return (
+            self.duckdb_model.polars(ano=ano, mes=mes, union_by_name=True)
+            .limit(limit)
+            .collect()
+        )
 
     def handle(self, *args, **options):
         ano   = options["ano"]
@@ -49,7 +53,7 @@ class BaseImportCommand(BaseCommand):
         self.stdout.write(f"🔍 Lendo {limit} registros de {label} (ano={ano}, mes={mes})...")
 
         try:
-            df = self._read_data(ano, mes, limit)  # ← usa o método sobrescrito se existir
+            df = self._read_data(ano, mes, limit)
         except Exception as e:
             self.stderr.write(self.style.ERROR(f"❌ Erro ao ler S3: {e}"))
             return

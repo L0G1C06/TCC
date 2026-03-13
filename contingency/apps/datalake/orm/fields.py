@@ -821,3 +821,38 @@ class ModeloDocFiscalField(StringField):
     Ex: '55' = NF-e, '57' = CT-e, '65' = NFC-e.
     """
     description: str = "Modelo documento fiscal: 55=NF-e, 57=CT-e, 65=NFC-e"
+
+@dataclass
+class CodigoCategoriaDespesaField(StringField):
+    """
+    Código da categoria econômica da despesa.
+    Nível mais alto da classificação da natureza de despesa na estrutura LOA/SIAFI.
+
+    Valores possíveis:
+        '3' = Despesas Correntes (pessoal, custeio, transferências)
+        '4' = Despesas de Capital (investimentos, inversões, amortização)
+        '9' = Reserva de Contingência
+
+    Presente em: despesas-execucao, orcamento-despesa, emendas-parlamentares-documentos.
+
+    Hierarquia completa da natureza de despesa:
+        Categoria Econômica → Grupo → Modalidade de Aplicação → Elemento → SubElemento
+    """
+    description: str = "Código categoria econômica da despesa: 3=Correntes, 4=Capital, 9=Reserva"
+
+
+@dataclass
+class CodigoSubElementoDespesaField(StringField):
+    """
+    Código do subelemento de despesa — detalhamento do elemento de despesa.
+    Nível mais granular da classificação da natureza de despesa no SIAFI.
+
+    Presente em: despesas-execucao (quando disponível), notas de empenho detalhadas.
+
+    ⚠️ Nem todos os órgãos utilizam o subelemento — campo frequentemente nulo
+    ou preenchido com '00' (sem desdobramento). Silver deve tratar '00' como ausente.
+
+    Hierarquia completa da natureza de despesa:
+        Categoria Econômica → Grupo → Modalidade de Aplicação → Elemento → SubElemento
+    """
+    description: str = "Código subelemento de despesa — nível mais granular do SIAFI; '00' = sem desdobramento"
