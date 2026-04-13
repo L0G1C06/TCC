@@ -1,0 +1,167 @@
+
+<style>
+  :root { --row: 44px; --label: 220px; --head: 48px; }
+  .gc { font-family: var(--font-sans); padding: 1rem 0; }
+  .gc-title { font-size: 15px; font-weight: 500; color: var(--color-text-primary); margin-bottom: 1.25rem; padding: 0 1rem; }
+  .gc-wrap { overflow-x: auto; }
+  .gc-inner { min-width: 900px; }
+  .gc-header { display: flex; height: var(--head); border-bottom: 0.5px solid var(--color-border-secondary); }
+  .gc-label-col { width: var(--label); min-width: var(--label); padding: 0 12px; display: flex; align-items: center; font-size: 12px; font-weight: 500; color: var(--color-text-secondary); flex-shrink: 0; }
+  .gc-months { flex: 1; display: flex; }
+  .gc-month { flex: 1; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 500; color: var(--color-text-secondary); border-left: 0.5px solid var(--color-border-tertiary); }
+  .gc-section { background: var(--color-background-secondary); border-left: 3px solid; margin: 6px 0 0 0; }
+  .gc-section-lbl { padding: 6px 12px; font-size: 12px; font-weight: 500; }
+  .gc-row { display: flex; align-items: center; height: var(--row); border-bottom: 0.5px solid var(--color-border-tertiary); }
+  .gc-row:last-child { border-bottom: none; }
+  .gc-row-lbl { width: var(--label); min-width: var(--label); padding: 0 12px; font-size: 12px; color: var(--color-text-primary); line-height: 1.3; flex-shrink: 0; }
+  .gc-track { flex: 1; position: relative; height: 100%; }
+  .gc-bar { position: absolute; height: 18px; top: 50%; transform: translateY(-50%); border-radius: 3px; }
+  .gc-milestone { position: absolute; width: 12px; height: 12px; top: 50%; transform: translateY(-50%) rotate(45deg); border: 2px solid; }
+  .gc-grid-line { position: absolute; top: 0; bottom: 0; width: 0.5px; background: var(--color-border-tertiary); }
+  .s-fund { border-color: #185FA5; }
+  .s-ferias { border-color: #0F6E56; }
+  .s-tcc2 { border-color: #993C1D; }
+  .lbl-fund { color: #185FA5; }
+  .lbl-ferias { color: #0F6E56; }
+  .lbl-tcc2 { color: #993C1D; }
+</style>
+<div class="gc">
+  <div class="gc-title">Cronograma TCC Aplicacao da Lei-NB em Bases Governamentais (com Portal Django)</div>
+  <div class="gc-wrap">
+    <div class="gc-inner" id="gcinner">
+
+      <div class="gc-header">
+        <div class="gc-label-col">Tarefa</div>
+        <div class="gc-months" id="months-header"></div>
+      </div>
+
+      <div id="gc-body"></div>
+    </div>
+  </div>
+</div>
+<script>
+const START = new Date('2026-03-01');
+const END   = new Date('2026-12-31');
+const totalDays = (END - START) / 86400000;
+
+const MONTHS = [];
+let cur = new Date(START);
+while (cur <= END) {
+  MONTHS.push(new Date(cur));
+  cur = new Date(cur.getFullYear(), cur.getMonth() + 1, 1);
+}
+
+const mhdr = document.getElementById('months-header');
+MONTHS.forEach(m => {
+  const d = document.createElement('div');
+  d.className = 'gc-month';
+  d.textContent = m.toLocaleDateString('pt-BR', { month: 'short', year: '2-digit' });
+  mhdr.appendChild(d);
+});
+
+function pct(d) { return ((d - START) / 86400000) / totalDays * 100; }
+function dur(s, e) { return ((e - s) / 86400000) / totalDays * 100; }
+function D(s) { return new Date(s); }
+
+const SECTIONS = [
+  {
+    label: 'TCC 1: Fundamentação', cls: 's-fund', lcls: 'lbl-fund',
+    rows: [
+      { label: 'Definir Escopo e Bases (CGU/BNDES)',        bar: [D('2026-03-01'), D('2026-03-22')], color: '#378ADD' },
+      { label: 'Entrega Report 1',                          milestone: D('2026-03-28'), color: '#185FA5' },
+      { label: 'Revisão Bibliográfica e Introdução',        bar: [D('2026-03-28'), D('2026-04-25')], color: '#378ADD' },
+      { label: 'Entrega Report 2',                          milestone: D('2026-04-25'), color: '#185FA5' },
+      { label: 'Pipeline de Ingestão (DuckDB/S3)',          bar: [D('2026-04-11'), D('2026-05-09')], color: '#378ADD' },
+      { label: 'Entrega Report 3',                          milestone: D('2026-05-16'), color: '#185FA5' },
+      { label: 'Core Matemático (Benford + Outliers)',      bar: [D('2026-05-09'), D('2026-06-13')], color: '#378ADD' },
+      { label: 'Entrega Report 4 + Apresentação',           milestone: D('2026-06-20'), color: '#185FA5' },
+      { label: 'Banca do Exame de Qualificação',            milestone: D('2026-06-27'), color: '#0C447C' },
+    ]
+  },
+  {
+    label: 'Férias: Desenvolvimento DataOps', cls: 's-ferias', lcls: 'lbl-ferias',
+    rows: [
+      { label: 'Refinamento do Pipeline (Chunks)',          bar: [D('2026-06-27'), D('2026-07-25')], color: '#1D9E75' },
+      { label: 'Desenvolvimento Score Composto e LHS',      bar: [D('2026-06-27'), D('2026-07-25')], color: '#1D9E75' },
+      { label: 'Desenvolvimento da Monografia (Fund.)',     bar: [D('2026-06-06'), D('2026-08-01')], color: '#5DCAA5' },
+      { label: 'Análise de Redes (Grafos) e Bunching',      bar: [D('2026-07-11'), D('2026-08-08')], color: '#1D9E75' },
+      { label: 'Desenvolvimento Backend (Django API)',       bar: [D('2026-07-04'), D('2026-07-25')], color: '#1D9E75' },
+      { label: 'Report 5 — Revisão Pós Qualificação',       milestone: D('2026-08-08'), color: '#0F6E56' },
+    ]
+  },
+  {
+    label: 'TCC 2: Resultados, Portal e Defesa', cls: 's-tcc2', lcls: 'lbl-tcc2',
+    rows: [
+      { label: 'Desenvolvimento Frontend (Dashboards)',     bar: [D('2026-08-08'), D('2026-09-12')], color: '#D85A30' },
+      { label: 'Integração com IA Generativa (NLP)',        bar: [D('2026-08-15'), D('2026-09-12')], color: '#D85A30' },
+      { label: 'Integração Back/Front e Testes',            bar: [D('2026-09-05'), D('2026-10-03')], color: '#D85A30' },
+      { label: 'Consolidação e Análise de Resultados',      bar: [D('2026-09-12'), D('2026-10-10')], color: '#D85A30' },
+      { label: 'Report 6 — Entrega dos Resultados',         milestone: D('2026-10-10'), color: '#993C1D' },
+      { label: 'Finalização da Monografia',                 bar: [D('2026-10-10'), D('2026-11-07')], color: '#993C1D', crit: true },
+      { label: 'Report 7 — Entrega da Monografia',          milestone: D('2026-11-14'), color: '#712B13' },
+      { label: 'Slides e Validação Técnica',                bar: [D('2026-11-14'), D('2026-12-05')], color: '#D85A30' },
+      { label: 'Banca TCC',                                 milestone: D('2026-12-05'), color: '#712B13' },
+      { label: 'Ajustes Finais e Termo Biblioteca',         milestone: D('2026-12-19'), color: '#712B13' },
+    ]
+  }
+];
+
+const gridLines = MONTHS.map(m => pct(m));
+
+function makeRow(row) {
+  const div = document.createElement('div');
+  div.className = 'gc-row';
+
+  const lbl = document.createElement('div');
+  lbl.className = 'gc-row-lbl';
+  lbl.textContent = row.label;
+
+  const track = document.createElement('div');
+  track.className = 'gc-track';
+
+  gridLines.forEach(p => {
+    const gl = document.createElement('div');
+    gl.className = 'gc-grid-line';
+    gl.style.left = p + '%';
+    track.appendChild(gl);
+  });
+
+  if (row.bar) {
+    const bar = document.createElement('div');
+    bar.className = 'gc-bar';
+    bar.style.left = pct(row.bar[0]) + '%';
+    bar.style.width = dur(row.bar[0], row.bar[1]) + '%';
+    bar.style.background = row.color;
+    bar.style.opacity = row.crit ? '1' : '0.85';
+    if (row.crit) bar.style.outline = '2px solid ' + row.color;
+    track.appendChild(bar);
+  }
+
+  if (row.milestone) {
+    const ms = document.createElement('div');
+    ms.className = 'gc-milestone';
+    ms.style.left = 'calc(' + pct(row.milestone) + '% - 6px)';
+    ms.style.borderColor = row.color;
+    ms.style.background = row.color;
+    track.appendChild(ms);
+  }
+
+  div.appendChild(lbl);
+  div.appendChild(track);
+  return div;
+}
+
+const body = document.getElementById('gc-body');
+SECTIONS.forEach(sec => {
+  const sDiv = document.createElement('div');
+  sDiv.className = 'gc-section ' + sec.cls;
+
+  const sLbl = document.createElement('div');
+  sLbl.className = 'gc-section-lbl ' + sec.lcls;
+  sLbl.textContent = sec.label;
+  sDiv.appendChild(sLbl);
+
+  sec.rows.forEach(row => sDiv.appendChild(makeRow(row)));
+  body.appendChild(sDiv);
+});
+</script>

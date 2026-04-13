@@ -1,0 +1,13 @@
+**32/32 passed.** Fase 4 concluída.
+
+O que está validado:
+
+- Lane 1 (MAD, JS, ZScore, Chi2) — comportamento correto em dados limpos e fraudados
+- Lane 2 (MAD2d, JS2d, ZScore2d) — detecta bunching invisível para Lane 1, aponta par correto
+- Lane 3 (LastDigitChi2, DigitPreference) — detecta spike em 0 e 5, conforme em uniforme real
+- Gate do ZScore — suprime flag quando MAD e JS conformes
+- M4Scorer — normalização local com múltiplas colunas
+- GlobalScorer — normalização cross-módulo, ranking correto
+- LHSSensitivity — 500 amostras com soma=1.0, robust_top3 correto nos dois extremos
+
+Próximo passo é o M5. Com a suíte verde pode avançar com confiança — qualquer regressão nas métricas vai aparecer imediatamente. Quer começar com o `fraud_injector.py` ou prefere montar primeiro o `pipeline_runner.py` em memória?
