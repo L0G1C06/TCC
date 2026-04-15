@@ -10,12 +10,36 @@ services:
     volumes:
       - ./warehouse:/home/iceberg/warehouse
       - ./notebooks:/home/iceberg/notebooks/notebooks
-      - ./data:/home/iceberg/data          # <-- add this line
-
+      - ./data:/home/iceberg/data
     environment:
       - AWS_ACCESS_KEY_ID=admin
       - AWS_SECRET_ACCESS_KEY=password
       - AWS_REGION=us-east-1
+      # ── Memória ──────────────────────────────────────────────
+      - SPARK_DRIVER_MEMORY=12g
+      - SPARK_EXECUTOR_MEMORY=12g
+      - SPARK_DRIVER_MEMORYOVERHEADFACTOR=0.1
+      - SPARK_EXECUTOR_MEMORYOVERHEADFACTOR=0.1
+      # ── CPUs ─────────────────────────────────────────────────
+      - SPARK_WORKER_CORES=0          # 0 = usa todos os cores disponíveis
+      - SPARK_EXECUTOR_CORES=4
+      # ── Shuffle / SQL ─────────────────────────────────────────
+      - SPARK_SQL_SHUFFLE_PARTITIONS=400
+    # ── Recursos do host expostos ao container ────────────────
+    deploy:
+      resources:
+        limits:
+          cpus: '0'                   # sem limite de CPU
+          memory: '0'                 # sem limite de memória
+    # alternativa para docker compose v2 sem swarm:
+    ipc: host                         # compartilha IPC com o host (reduz overhead)
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
     ports:
       - 8888:8888
       - 8080:8080
